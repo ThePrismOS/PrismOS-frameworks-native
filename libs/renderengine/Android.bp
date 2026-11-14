@@ -61,6 +61,16 @@ filegroup {
     ],
 }
 
+// Header-only subset (Prism spatial layout helpers) usable from host tests that do not link
+// the GL backend.
+cc_library_headers {
+    name: "librenderengine_prism_headers",
+    host_supported: true,
+    export_include_dirs: ["include"],
+    header_libs: ["libmath_headers"],
+    export_header_lib_headers: ["libmath_headers"],
+}
+
 filegroup {
     name: "librenderengine_gl_sources",
     srcs: [

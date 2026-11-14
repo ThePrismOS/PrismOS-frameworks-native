@@ -31,6 +31,7 @@
 #include <compositionengine/impl/planner/Planner.h>
 #include <ftl/future.h>
 
+#include <future>
 #include <thread>
 
 #include "renderengine/ExternalTexture.h"
@@ -41,6 +42,7 @@
 
 #include <renderengine/DisplaySettings.h>
 #include <renderengine/RenderEngine.h>
+#include <math/mat4.h>
 
 // TODO(b/129481165): remove the #pragma below and fix conversion issues
 #pragma clang diagnostic pop // ignored "-Wconversion"
@@ -466,6 +468,13 @@ void Output::rebuildLayerStacks(const compositionengine::CompositionRefreshArgs&
 
     // Process the layers to determine visibility and coverage
     compositionengine::Output::CoverageState coverage{layerFESet};
+    // PrismOS scene mode: the spatial scene (the sky, the grid, the quads, and the spatial
+    // windows in the client target) replaces the entire flat UI — the coverage pass collects
+    // nothing, so no layer reaches the HWC and the client target is the whole frame.
+    coverage.prismSceneReplacesUi = refreshArgs.prismScene && refreshArgs.prismScene->enabled &&
+            refreshArgs.stereoComposition && refreshArgs.stereoComposition->enabled &&
+            (!refreshArgs.stereoComposition->displayId ||
+             refreshArgs.stereoComposition->displayId == getDisplayId());
     collectVisibleLayers(refreshArgs, coverage);
 
     // Compute the resulting coverage for this output, and store it for later
@@ -503,10 +512,26 @@ void Output::ensureOutputLayerIfVisible(sp<compositionengine::LayerFE>& layerFE,
     if (!coverage.latchedLayers.count(layerFE)) {
         coverage.latchedLayers.insert(layerFE);
         layerFE->prepareCompositionState(compositionengine::LayerFE::StateSubset::BasicGeometry);
+        // PrismOS bring-up diagnostics: latch state of every application layer.
+        static uint32_t prismLatchDiag = 0;
+        const char* prismName = layerFE->getDebugName();
+        if (++prismLatchDiag % 30 == 1 && strncmp(prismName, "com.android.", 12) == 0) {
+            ALOGD("PrismOS latch: '%s' vis=%d tag=%d incl=%d", prismName,
+                  layerFE->getCompositionState()->isVisible ? 1 : 0,
+                  layerFE->getCompositionState()->prismSpatialWindow ? 1 : 0,
+                  includesLayer(layerFE) ? 1 : 0);
+        }
     }
 
     // Only consider the layers on this output
     if (!includesLayer(layerFE)) {
+        // PrismOS bring-up diagnostics: application layers must never be silently filtered
+        // out before the visibility gates — a missing spatial window starts its search here.
+        static uint32_t prismIncludeDiag = 0;
+        const char* prismName = layerFE->getDebugName();
+        if (++prismIncludeDiag % 30 == 1 && strncmp(prismName, "com.android.", 12) == 0) {
+            ALOGD("PrismOS incl: filtered out '%s'", prismName);
+        }
         return;
     }
 
@@ -516,8 +541,18 @@ void Output::ensureOutputLayerIfVisible(sp<compositionengine::LayerFE>& layerFE,
         return;
     }
 
-    // handle hidden surfaces by setting the visible region to empty
-    if (CC_UNLIKELY(!layerFEState->isVisible)) {
+    // handle hidden surfaces by setting the visible region to empty. PrismOS spatial
+    // windows survive a hidden flat surface: a background app stays in the world at its
+    // retained placement while the 2D stack shows something else. The window leaves the
+    // scene only when its layer (and buffer) leaves the layer stack entirely.
+    if (CC_UNLIKELY(!layerFEState->isVisible) && !layerFEState->prismSpatialWindow) {
+        // PrismOS bring-up diagnostics: report application layers rejected here.
+        const char* prismName = layerFE->getDebugName();
+        if (strncmp(prismName, "com.android.systemui", 20) != 0 &&
+            strncmp(prismName, "Dim layer", 9) != 0) {
+            ALOGD("PrismOS gate: rejected '%s' tag=%d", prismName,
+                  layerFEState->prismSpatialWindow ? 1 : 0);
+        }
         return;
     }
 
@@ -580,7 +615,9 @@ void Output::ensureOutputLayerIfVisible(sp<compositionengine::LayerFE>& layerFE,
         shadowRegion = visibleRegion.subtract(visibleRect);
     }
 
-    if (visibleRegion.isEmpty()) {
+    // PrismOS: a world-space window stays in the composition even when the 2D stack fully
+    // covers it — its content is drawn into the spatial scene, not onto this plane.
+    if (visibleRegion.isEmpty() && !layerFEState->prismSpatialWindow) {
         return;
     }
 
@@ -637,7 +674,10 @@ void Output::ensureOutputLayerIfVisible(sp<compositionengine::LayerFE>& layerFE,
     // subtract the opaque region covered by the layers above us
     visibleRegion.subtractSelf(coverage.aboveOpaqueLayers);
 
-    if (visibleRegion.isEmpty()) {
+    // PrismOS: keep a world-space window in the composition even when a fully opaque layer
+    // covers it on the 2D plane; the flat draw of it is skipped via skipContentDraw, and the
+    // spatial scene draws its buffer at its own world position.
+    if (visibleRegion.isEmpty() && !layerFEState->prismSpatialWindow) {
         return;
     }
 
@@ -696,7 +736,16 @@ void Output::ensureOutputLayerIfVisible(sp<compositionengine::LayerFE>& layerFE,
     const auto& outputState = getState();
     Region drawRegion(outputState.transform.transform(visibleNonTransparentRegion));
     drawRegion.andSelf(outputState.displaySpace.getBoundsAsRect());
-    if (drawRegion.isEmpty()) {
+    // PrismOS: a world-space window keeps its output layer even when the 2D draw region is
+    // empty (fully covered); the spatial scene composites its buffer at the world position.
+    if (drawRegion.isEmpty() && !layerFEState->prismSpatialWindow) {
+        const char* prismName = layerFE->getDebugName();
+        if (strncmp(prismName, "com.android.systemui", 20) != 0 &&
+            strncmp(prismName, "Dim layer", 9) != 0 &&
+            strncmp(prismName, "Splash Screen", 13) != 0) {
+            ALOGD("PrismOS drawgate: rejected '%s' tag=%d", prismName,
+                  layerFEState->prismSpatialWindow ? 1 : 0);
+        }
         return;
     }
 
@@ -753,7 +802,11 @@ void Output::updateCompositionState(const compositionengine::CompositionRefreshA
     }
 
     mLayerRequestingBackgroundBlur = findLayerRequestingBackgroundComposition();
-    bool forceClientComposition = mLayerRequestingBackgroundBlur != nullptr;
+    const bool stereoComposition = refreshArgs.stereoComposition &&
+            refreshArgs.stereoComposition->enabled &&
+            (!refreshArgs.stereoComposition->displayId ||
+             refreshArgs.stereoComposition->displayId == getDisplayId());
+    bool forceClientComposition = mLayerRequestingBackgroundBlur != nullptr || stereoComposition;
 
     for (auto* layer : getOutputLayersOrderedByZ()) {
         layer->updateCompositionState(refreshArgs.updatingGeometryThisFrame,
@@ -1199,6 +1252,8 @@ bool Output::dequeueRenderBuffer(base::unique_fd* bufferFence,
 std::optional<base::unique_fd> Output::composeSurfaces(
         const Region& debugRegion, const compositionengine::CompositionRefreshArgs& refreshArgs,
         std::shared_ptr<renderengine::ExternalTexture> tex, base::unique_fd& fd) {
+    // PRISM_TRACE_OUTPUT_ENTRY
+
     ATRACE_CALL();
     ALOGV(__FUNCTION__);
 
@@ -1257,10 +1312,130 @@ std::optional<base::unique_fd> Output::composeSurfaces(
                                               clientCompositionLayersFE);
     appendRegionFlashRequests(debugRegion, clientCompositionLayers);
 
+    // RenderEngine has one DisplaySettings object and one target per drawLayers
+    // call. For the first PrismOS transport, materialize both eyes as two
+    // client-composition views in that one target. The target dimensions are
+    // unchanged; the vendor/display configuration decides how the packed
+    // contents are consumed by the physical panel.
+    const bool hasBlur = std::any_of(
+            clientCompositionLayers.begin(), clientCompositionLayers.end(),
+            [](const auto& layer) {
+                return layer.backgroundBlurRadius > 0 || !layer.blurRegions.empty();
+            });
+    if (refreshArgs.stereoComposition && refreshArgs.stereoComposition->enabled &&
+        (!refreshArgs.stereoComposition->displayId ||
+         refreshArgs.stereoComposition->displayId == getDisplayId()) &&
+        refreshArgs.stereoComposition->layout ==
+                compositionengine::StereoCompositionPlan::Layout::kSideBySide) {
+        if (hasBlur) {
+            // A single RenderEngine pass does not isolate the blur history of
+            // two views. Keep the frame correct by using the existing mono
+            // path until a per-view blur surface is added to RenderEngine.
+            ALOGW("PrismOS stereo disabled for output [%s] because blur "
+                  "requires isolated per-eye composition", mName.c_str());
+        } else if (clientCompositionDisplay.orientation == ui::Transform::ROT_0) {
+    const auto logicalClip = clientCompositionDisplay.clip;
+
+    // PrismOS stereo packing for a PORTRAIT framebuffer (e.g. 1080x2248): the two eye
+    // viewports are stacked along the framebuffer height (GL bottom half = left eye, top
+    // half = right eye), and each region carries the logical frame rotated 90 degrees —
+    // the logical height runs along the region width, the logical width along the region
+    // height. The old implementation assumed a landscape framebuffer and packed the eyes
+    // off-screen, producing a black frame.
+    //
+    // Tunables (live, no rebuild):
+    //   debug.prismos.output_rotation  90 (default) / 270 flips the rotation direction
+    //   debug.prismos.output_swap      true swaps the left/right eye halves
+    const int fbWidth = clientCompositionDisplay.physicalDisplay.getWidth();
+    const int fbHeight = clientCompositionDisplay.physicalDisplay.getHeight();
+    const float eyeHeight = fbHeight * 0.5f;
+    const float logicalWidth = logicalClip.getWidth();
+    const float logicalHeight = logicalClip.getHeight();
+    const float scaleX = static_cast<float>(fbWidth) / logicalHeight;
+    const float scaleY = static_cast<float>(eyeHeight) / logicalWidth;
+    const bool swapEyes = android::base::GetBoolProperty("debug.prismos.output_swap", false);
+    const bool flipRotation =
+            android::base::GetBoolProperty("debug.prismos.output_flip", false);
+    const float eyeOffsetLeft = swapEyes ? eyeHeight : 0.0f;
+    const float eyeOffsetRight = swapEyes ? 0.0f : eyeHeight;
+    const float rotationSign = flipRotation ? -1.0f : 1.0f;
+
+    const mat4 rotationScale =
+            mat4::scale(vec4(scaleX, scaleY, 1.0f, 1.0f)) *
+            mat4::rotate(rotationSign * static_cast<float>(M_PI) / 2.0f,
+                         vec3(0.0f, 0.0f, 1.0f));
+
+    const mat4 leftPack =
+            mat4::translate(vec4(fbWidth, eyeOffsetLeft, 0.0f, 1.0f)) * rotationScale;
+
+    const mat4 rightPack =
+            mat4::translate(vec4(fbWidth, eyeOffsetRight, 0.0f, 1.0f)) * rotationScale;
+
+    const auto monoLayers = std::move(clientCompositionLayers);
+    // PrismOS scene mode: the client list stays UNPACKED — the scene path draws the spatial
+    // windows with their own world transforms, and the flat draw is skipped (flat_layers=0).
+    // The packing applies only in the non-scene stereo mode.
+    if (!outputState.prismSceneReplacesUi) {
+        clientCompositionLayers.reserve(monoLayers.size() * 2);
+
+        const auto appendEye = [&](const mat4& pack, const mat4& view) {
+            for (const auto& source : monoLayers) {
+                auto eye = source;
+
+                const mat4 eyeTransform =
+                        pack * view;
+
+                eye.geometry.positionTransform =
+                        eyeTransform * source.geometry.positionTransform;
+
+                eye.blurRegionTransform =
+                        eyeTransform * source.blurRegionTransform;
+
+                clientCompositionLayers.emplace_back(std::move(eye));
+            }
+        };
+
+        appendEye(leftPack, refreshArgs.stereoComposition->leftViewTransform);
+        appendEye(rightPack, refreshArgs.stereoComposition->rightViewTransform);
+    } else {
+        clientCompositionLayers = std::move(monoLayers);
+    }
+} else {
+            // The initial packed layout is defined in the canonical logical
+            // orientation. Do not reinterpret Android rotation as VR.
+            ALOGW("PrismOS stereo disabled for output [%s] with non-zero "
+                  "composition orientation", mName.c_str());
+        }
+    }
+
+    // PrismOS: the stereo packing and the scene pass are inseparable — the packed layer
+    // transforms are only meaningful in the scene path. There is no mono fallback: blur and
+    // orientation variations render through the scene as well (blur draws as a plain layer).
+    const bool prismSceneEnabled = refreshArgs.prismScene && refreshArgs.prismScene->enabled &&
+            refreshArgs.stereoComposition && refreshArgs.stereoComposition->enabled &&
+            (!refreshArgs.stereoComposition->displayId ||
+             refreshArgs.stereoComposition->displayId == getDisplayId()) &&
+            refreshArgs.stereoComposition->layout ==
+                    compositionengine::StereoCompositionPlan::Layout::kSideBySide;
+
+    ALOGV("PRISM-CHECK: output=%s stereo=%d scene=%d layout=%d "
+      "blur=%d orientation=%d enabled=%d layers=%zu",
+      mName.c_str(),
+      refreshArgs.stereoComposition &&
+              refreshArgs.stereoComposition->enabled,
+      refreshArgs.prismScene && refreshArgs.prismScene->enabled,
+      refreshArgs.stereoComposition
+              ? static_cast<int>(refreshArgs.stereoComposition->layout)
+              : -1,
+      hasBlur,
+      static_cast<int>(clientCompositionDisplay.orientation),
+      prismSceneEnabled,
+      clientCompositionLayers.size());
+
     OutputCompositionState& outputCompositionState = editState();
     // Check if the client composition requests were rendered into the provided graphic buffer. If
     // so, we can reuse the buffer and avoid client composition.
-    if (mClientCompositionRequestCache) {
+    if (mClientCompositionRequestCache && !prismSceneEnabled) {
         if (mClientCompositionRequestCache->exists(tex->getBuffer()->getId(),
                                                    clientCompositionDisplay,
                                                    clientCompositionLayers)) {
@@ -1308,13 +1483,21 @@ std::optional<base::unique_fd> Output::composeSurfaces(
     // over to RenderEngine, in which case this flag can be removed from the drawLayers interface.
     const bool useFramebufferCache = outputState.layerFilter.toInternalDisplay;
 
-    auto fenceResult =
-            toFenceResult(renderEngine
-                                  .drawLayers(clientCompositionDisplay, clientRenderEngineLayers,
-                                              tex, useFramebufferCache, std::move(fd))
-                                  .get());
+    std::future<renderengine::RenderEngineResult> renderFuture;
+    if (prismSceneEnabled) {
+        ALOGV("PRISM3D: scene pass requested for output [%s]", mName.c_str());
+        renderFuture = renderEngine.drawLayersWithPrismScene(
+                clientCompositionDisplay, clientRenderEngineLayers, tex, useFramebufferCache,
+                std::move(fd), *refreshArgs.prismScene);
+    } else {
+        renderFuture = renderEngine.drawLayers(clientCompositionDisplay, clientRenderEngineLayers,
+                                               tex, useFramebufferCache, std::move(fd));
+    }
 
-    if (mClientCompositionRequestCache && fenceStatus(fenceResult) != NO_ERROR) {
+    auto fenceResult = toFenceResult(renderFuture.get());
+
+    if (mClientCompositionRequestCache && !prismSceneEnabled &&
+        fenceStatus(fenceResult) != NO_ERROR) {
         // If rendering was not successful, remove the request from the cache.
         mClientCompositionRequestCache->remove(tex->getBuffer()->getId());
     }
@@ -1354,7 +1537,11 @@ std::vector<LayerFE::LayerSettings> Output::generateClientCompositionRequests(
 
         const Region clip(viewportRegion.intersect(layerState.visibleRegion));
         ALOGV("Layer: %s", layerFE.getDebugName());
-        if (clip.isEmpty()) {
+        // PrismOS: spatial windows stay in the client list even when the flat clip is empty
+        // (a background app fully covered by the front one). The flat draw of such a layer is
+        // skipped via skipContentDraw and the spatial scene samples its buffer at the window's
+        // world placement.
+        if (clip.isEmpty() && !layerFEState->prismSpatialWindow) {
             ALOGV("  Skipping for empty clip");
             firstLayer = false;
             continue;
@@ -1450,6 +1637,7 @@ void Output::appendRegionFlashRequests(
         clientCompositionLayers.push_back(layerSettings);
     }
 }
+
 
 void Output::setExpensiveRenderingExpected(bool) {
     // The base class does nothing with this call.
@@ -1563,6 +1751,12 @@ void Output::setTreat170mAsSrgb(bool enable) {
 }
 
 bool Output::canPredictCompositionStrategy(const CompositionRefreshArgs& refreshArgs) {
+    // PrismOS: the scene pass composes on the draw thread with per-frame uniforms (head
+    // rotation); the strategy prediction path would double-compose every frame. Run the
+    // single deterministic composition instead.
+    if (refreshArgs.prismScene && refreshArgs.prismScene->enabled) {
+        return false;
+    }
     uint64_t lastOutputLayerHash = getState().lastOutputLayerHash;
     uint64_t outputLayerHash = getState().outputLayerHash;
     editState().lastOutputLayerHash = outputLayerHash;

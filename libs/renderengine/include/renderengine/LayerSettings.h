@@ -174,6 +174,13 @@ struct LayerSettings {
     // Name associated with the layer for debugging purposes.
     std::string name;
 
+    // PrismOS: explicitly tagged by WindowManager as a spatial window.
+    bool prismSpatialWindow = false;
+
+    // PrismOS: stable per-activity window identity from layer metadata (key 10001). Zero when
+    // WindowManager did not provide one; placement memory then falls back to the layer name.
+    int32_t prismSpatialWindowId = 0;
+
     // Luminance of the white point for this layer. Used for linear dimming.
     // Individual layers will be dimmed by (whitePointNits / maxWhitePoint).
     // If white point nits are unknown, then this layer is assumed to have the
@@ -232,7 +239,9 @@ static inline bool operator==(const LayerSettings& lhs, const LayerSettings& rhs
             lhs.skipContentDraw == rhs.skipContentDraw && lhs.shadow == rhs.shadow &&
             lhs.backgroundBlurRadius == rhs.backgroundBlurRadius &&
             lhs.blurRegionTransform == rhs.blurRegionTransform &&
-            lhs.stretchEffect == rhs.stretchEffect && lhs.whitePointNits == rhs.whitePointNits;
+            lhs.stretchEffect == rhs.stretchEffect && lhs.whitePointNits == rhs.whitePointNits &&
+            lhs.prismSpatialWindow == rhs.prismSpatialWindow &&
+            lhs.prismSpatialWindowId == rhs.prismSpatialWindowId;
 }
 
 static inline void PrintTo(const Buffer& settings, ::std::ostream* os) {

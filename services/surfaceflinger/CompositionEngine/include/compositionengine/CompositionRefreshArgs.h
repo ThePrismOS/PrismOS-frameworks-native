@@ -24,6 +24,8 @@
 #include <compositionengine/LayerFE.h>
 #include <compositionengine/OutputColorSetting.h>
 #include <math/mat4.h>
+#include <renderengine/PrismScene.h>
+#include <ui/DisplayIdentification.h>
 #include <ui/FenceTime.h>
 #include <ui/Transform.h>
 
@@ -33,11 +35,45 @@ using Layers = std::vector<sp<compositionengine::LayerFE>>;
 using Outputs = std::vector<std::shared_ptr<compositionengine::Output>>;
 
 /**
+ * Describes a stereo composition performed by one Output and one target.
+ *
+ * The plan is deliberately expressed in terms of per-eye transforms rather
+ * than Android displays. Output expands its client-composition requests into
+ * two views of the same LayerFE set and packs them into the existing target.
+ */
+struct StereoCompositionPlan {
+    enum class Layout {
+        kSideBySide,
+    };
+
+    bool enabled{false};
+    Layout layout{Layout::kSideBySide};
+
+    // Identity is the initial PrismOS view. These matrices are in the logical
+    // layer-stack space and can later be replaced by head-pose and eye-offset
+    // transforms without changing the WindowManager hierarchy.
+    mat4 leftViewTransform{};
+    mat4 rightViewTransform{};
+
+    // Restrict activation to one existing logical display. An unset value is
+    // useful for tests and means that the plan applies to every output.
+    std::optional<DisplayId> displayId;
+};
+
+/**
  * A parameter object for refreshing a set of outputs
  */
 struct CompositionRefreshArgs {
     // All the outputs being refreshed
     Outputs outputs;
+
+    // Optional single-output stereo composition. Empty for the existing mono
+    // Android path. The target remains the RenderSurface owned by that output.
+    std::optional<StereoCompositionPlan> stereoComposition;
+
+    // Optional GLES-only bring-up scene. The target remains the same client target owned by the
+    // Output; this does not create another display or RenderSurface.
+    std::optional<renderengine::PrismSceneSettings> prismScene;
 
     // All the layers that are potentially visible in the outputs. The order of
     // the layers is important, and should be in traversal order from back to

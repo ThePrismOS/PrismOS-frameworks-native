@@ -24,6 +24,7 @@
 #include <renderengine/Framebuffer.h>
 #include <renderengine/Image.h>
 #include <renderengine/LayerSettings.h>
+#include <renderengine/PrismScene.h>
 #include <stdint.h>
 #include <sys/types.h>
 #include <ui/GraphicTypes.h>
@@ -165,6 +166,13 @@ public:
             const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
             base::unique_fd&& bufferFence);
 
+    // Renders the ordinary Android layers and an optional internal Prism scene into the same
+    // target. Backends which do not implement the scene path fall back to drawLayers().
+    virtual std::future<RenderEngineResult> drawLayersWithPrismScene(
+            const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+            const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
+            base::unique_fd&& bufferFence, const PrismSceneSettings& scene);
+
     // Clean-up method that should be called on the main thread after the
     // drawFence returned by drawLayers fires. This method will free up
     // resources used by the most recently drawn frame. If the frame is still
@@ -241,6 +249,12 @@ protected:
             const DisplaySettings& display, const std::vector<LayerSettings>& layers,
             const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
             base::unique_fd&& bufferFence) = 0;
+
+    virtual void drawLayersInternalWithPrismScene(
+            const std::shared_ptr<std::promise<RenderEngineResult>>&& resultPromise,
+            const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+            const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
+            base::unique_fd&& bufferFence, const PrismSceneSettings& scene);
 };
 
 struct RenderEngineCreationArgs {

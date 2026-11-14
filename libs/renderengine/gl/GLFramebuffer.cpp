@@ -39,6 +39,9 @@ GLFramebuffer::GLFramebuffer(GLESRenderEngine& engine)
 
 GLFramebuffer::~GLFramebuffer() {
     setNativeWindowBuffer(nullptr, false, false);
+    if (mDepthBufferName != 0) {
+        glDeleteRenderbuffers(1, &mDepthBufferName);
+    }
     glDeleteFramebuffers(1, &mFramebufferName);
     glDeleteTextures(1, &mTextureName);
 }
@@ -92,6 +95,33 @@ void GLFramebuffer::allocateBuffers(uint32_t width, uint32_t height, void* data)
     if (mStatus != GL_FRAMEBUFFER_COMPLETE) {
         ALOGE("Frame buffer is not complete. Error %d", mStatus);
     }
+}
+
+bool GLFramebuffer::prepareDepthBuffer(uint32_t width, uint32_t height) {
+    if (mDepthBufferName == 0) {
+        glGenRenderbuffers(1, &mDepthBufferName);
+    }
+
+    if (mDepthBufferWidth != width || mDepthBufferHeight != height) {
+        glBindRenderbuffer(GL_RENDERBUFFER, mDepthBufferName);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, width, height);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+        mDepthBufferWidth = width;
+        mDepthBufferHeight = height;
+    }
+
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER,
+                              mDepthBufferName);
+    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        ALOGE("PrismOS depth framebuffer is incomplete: %#x", status);
+        return false;
+    }
+    return true;
+}
+
+void GLFramebuffer::detachDepthBuffer() {
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, 0);
 }
 
 void GLFramebuffer::bind() const {

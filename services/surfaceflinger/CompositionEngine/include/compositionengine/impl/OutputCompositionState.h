@@ -48,6 +48,10 @@ struct OutputCompositionState {
     // If false, composition will not be performed for this display
     bool isEnabled{false};
 
+    // PrismOS scene mode: the spatial scene (sky, grid, quads, windows in the client target)
+    // replaces the entire flat UI — no layer reaches the HWC and the flat draw is skipped.
+    bool prismSceneReplacesUi{false};
+
     // If false, this output is not considered secure
     bool isSecure{false};
 

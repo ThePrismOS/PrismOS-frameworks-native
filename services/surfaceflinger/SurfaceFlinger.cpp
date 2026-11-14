@@ -37,6 +37,7 @@
 #include <android/native_window.h>
 #include <android/os/IInputFlinger.h>
 #include <binder/IPCThreadState.h>
+#include <binder/Parcel.h>
 #include <binder/IServiceManager.h>
 #include <binder/PermissionCache.h>
 #include <compositionengine/CompositionEngine.h>
@@ -66,9 +67,11 @@
 #include <hidl/ServiceManagement.h>
 #include <layerproto/LayerProtoParser.h>
 #include <log/log.h>
+#include <math/quat.h>
 #include <private/android_filesystem_config.h>
 #include <private/gui/SyncFeatures.h>
 #include <processgroup/processgroup.h>
+#include <renderengine/PrismScene.h>
 #include <renderengine/RenderEngine.h>
 #include <renderengine/impl/ExternalTexture.h>
 #include <sys/types.h>
@@ -93,10 +96,13 @@
 #include <cerrno>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 #include <optional>
 #include <type_traits>
 #include <unordered_map>
@@ -131,6 +137,7 @@
 #include "MonitoredProducer.h"
 #include "MutexUtils.h"
 #include "NativeWindowSurface.h"
+#include "PrismHeadTracker.h"
 #include "RefreshRateOverlay.h"
 #include "RegionSamplingThread.h"
 #include "Scheduler/DispSyncSource.h"
@@ -232,6 +239,132 @@ float getDensityFromProperty(const char* property, bool required) {
     return density;
 }
 
+constexpr float kPrismDegreesToRadians = 3.14159265358979323846f / 180.0f;
+constexpr size_t kPrismMatrixElementCount = 16;
+
+std::optional<float> getPrismDebugHeadAngleRadians(const char* property) {
+    char value[PROPERTY_VALUE_MAX] = {};
+    if (property_get(property, value, nullptr) <= 0) {
+        return std::nullopt;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    const float degrees = std::strtof(value, &end);
+    if (end == value || *end != '\0' || errno == ERANGE || !std::isfinite(degrees)) {
+        return std::nullopt;
+    }
+
+    const float radians = degrees * kPrismDegreesToRadians;
+    return std::isfinite(radians) ? std::optional<float>(radians) : std::nullopt;
+}
+
+float getPrismFloatProperty(const char* property, float defaultValue) {
+    char value[PROPERTY_VALUE_MAX] = {};
+    if (property_get(property, value, nullptr) <= 0) {
+        return defaultValue;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    const float parsed = std::strtof(value, &end);
+    if (end == value || *end != '\0' || errno == ERANGE || !std::isfinite(parsed)) {
+        return defaultValue;
+    }
+    return parsed;
+}
+
+// PrismOS: per-window placement overrides. Indices are scanned from
+// debug.prismos.window.0.id and stop at the first unset id; every remaining key of the same
+// index positions that window in world space. Matching is by window tag (the stable prefix of
+// the layer name), so "Chrome" also reaches "Chrome#12". Windows without an entry keep their
+// automatic ring layout, which is also what an override removes back to when the property is
+// cleared.
+constexpr size_t kPrismMaxWindowOverrides = 8;
+
+void appendPrismWindowOverrides(renderengine::PrismSceneSettings* scene) {
+    for (size_t i = 0; i < kPrismMaxWindowOverrides; ++i) {
+        const std::string base = "debug.prismos.window." + std::to_string(i) + ".";
+        const std::string id = base::GetProperty(base + "id", "");
+        if (id.empty()) {
+            break;
+        }
+        renderengine::PrismSpatialWindowSettings settings;
+        settings.id = id;
+        settings.centerXMeters = getPrismFloatProperty((base + "x").c_str(), 0.0f);
+        settings.centerYMeters = getPrismFloatProperty((base + "y").c_str(), 0.0f);
+        settings.distanceMeters =
+                getPrismFloatProperty((base + "dist").c_str(), scene->spatialWindowDistanceMeters);
+        settings.heightMeters =
+                getPrismFloatProperty((base + "height").c_str(), scene->spatialWindowHeightMeters);
+        settings.suppressFlatCopy =
+                base::GetBoolProperty(base + "flat", scene->spatialWindowSuppressFlatCopy);
+        scene->spatialWindows.push_back(std::move(settings));
+    }
+}
+
+bool isFinitePrismHeadTransform(const mat4& transform) {
+    const float* values = transform.asArray();
+    return std::all_of(values, values + kPrismMatrixElementCount,
+                       [](float value) { return std::isfinite(value); });
+}
+
+mat4 getPrismDebugHeadTransform() {
+    if (!base::GetBoolProperty("debug.prismos.head.override", false)) {
+        return mat4();
+    }
+
+    const auto yaw = getPrismDebugHeadAngleRadians("debug.prismos.head.yaw");
+    const auto pitch = getPrismDebugHeadAngleRadians("debug.prismos.head.pitch");
+    const auto roll = getPrismDebugHeadAngleRadians("debug.prismos.head.roll");
+    if (!yaw || !pitch || !roll) {
+        return mat4();
+    }
+
+    const mat4 headTransform =
+            mat4(quat::fromAxisAngle(vec3(0.0f, 1.0f, 0.0f), *yaw)) *
+            mat4(quat::fromAxisAngle(vec3(1.0f, 0.0f, 0.0f), *pitch)) *
+            mat4(quat::fromAxisAngle(vec3(0.0f, 0.0f, 1.0f), *roll));
+    return isFinitePrismHeadTransform(headTransform) ? headTransform : mat4();
+}
+
+mat4 getPrismImuHeadTransform(const PrismHeadTracker& headTracker) {
+    PrismHeadTracker::Quaternion orientation;
+
+    if (!headTracker.getLatestQuaternion(&orientation)) {
+        ALOGI("PRISM HEAD FROM TRACKER: NO QUATERNION");
+        return mat4();
+    }
+
+    if (base::GetBoolProperty("debug.prismos.head.log", false)) {
+        ALOGI("PRISM HEAD FROM TRACKER q=[%.4f %.4f %.4f %.4f]",
+              orientation.x, orientation.y, orientation.z, orientation.w);
+    }
+
+    mat4 headTransform = mat4(quat(orientation.w, orientation.x, orientation.y, orientation.z));
+
+    // PrismOS: constant frame alignment for the headset mount. The tracker's mount pitch
+    // cannot cover a headset worn with an extra roll/pitch offset, which shows up as a
+    // permanently tilted horizon. Rotate the head's world frame by the configured offsets
+    // (degrees) so the horizon sits level; tune live via setprop.
+    const float rollOffsetRadians =
+            getPrismFloatProperty("debug.prismos.head.roll_offset", 0.0f) *
+            static_cast<float>(M_PI) / 180.0f;
+    const float pitchOffsetRadians =
+            getPrismFloatProperty("debug.prismos.head.pitch_offset", 0.0f) *
+            static_cast<float>(M_PI) / 180.0f;
+    if (rollOffsetRadians != 0.0f || pitchOffsetRadians != 0.0f) {
+        const mat4 correction =
+                mat4(quat::fromAxisAngle(vec3(0.0f, 0.0f, 1.0f), rollOffsetRadians)) *
+                mat4(quat::fromAxisAngle(vec3(1.0f, 0.0f, 0.0f), pitchOffsetRadians));
+        headTransform = correction * headTransform;
+    }
+
+    return isFinitePrismHeadTransform(headTransform)
+            ? headTransform
+            : mat4();
+}
+
 // Currently we only support V0_SRGB and DISPLAY_P3 as composition preference.
 bool validateCompositionDataspace(Dataspace dataspace) {
     return dataspace == Dataspace::V0_SRGB || dataspace == Dataspace::DISPLAY_P3;
@@ -328,6 +461,8 @@ bool callingThreadHasInternalSystemWindowAccess() {
 
 SurfaceFlinger::SurfaceFlinger(Factory& factory, SkipInitializationTag)
       : mFactory(factory),
+        mPrismHeadTracker(std::make_unique<PrismHeadTracker>()),
+        mPrismHandTracker(std::make_unique<PrismHandTracker>()),
         mPid(getpid()),
         mInterceptor(mFactory.createSurfaceInterceptor()),
         mTimeStats(std::make_shared<impl::TimeStats>()),
@@ -488,7 +623,12 @@ void SurfaceFlinger::binderDied(const wp<IBinder>&) {
 }
 
 void SurfaceFlinger::run() {
+    mPrismHeadTracker->setInvalidateCallback([this] { mScheduler->scheduleFrame(); });
+    mPrismHeadTracker->start();
+    mPrismHandTracker->start();
     mScheduler->run();
+    mPrismHandTracker->stop();
+    mPrismHeadTracker->stop();
 }
 
 sp<ISurfaceComposerClient> SurfaceFlinger::createConnection() {
@@ -2197,12 +2337,101 @@ void SurfaceFlinger::composite(nsecs_t frameTime, int64_t vsyncId)
     ATRACE_FORMAT("%s %" PRId64, __func__, vsyncId);
 
     compositionengine::CompositionRefreshArgs refreshArgs;
+
     const auto& displays = FTL_FAKE_GUARD(mStateLock, mDisplays);
     refreshArgs.outputs.reserve(displays.size());
     std::vector<DisplayId> displayIds;
     for (const auto& [_, display] : displays) {
         refreshArgs.outputs.push_back(display->getCompositionDisplay());
         displayIds.push_back(display->getId());
+#if defined(PRISMOS_STEREO_COMPOSITOR)
+        if (display->isPrimary() &&
+            base::GetBoolProperty("debug.prismos.stereo", false) &&
+            !base::GetBoolProperty("debug.prismos.legacy", false)) {
+            compositionengine::StereoCompositionPlan plan;
+            plan.enabled = true;
+            plan.displayId = display->getId();
+            refreshArgs.stereoComposition = std::move(plan);
+
+            if (base::GetBoolProperty("debug.prismos.3d", false)) {
+                renderengine::PrismSceneSettings scene;
+                scene.enabled = true;
+                scene.spatialWindowEnabled =
+                        base::GetBoolProperty("debug.prismos.spatial_window", false);
+                // Horizontal FOV of one eye view (portrait panel: two eye viewports stacked
+                // vertically). automaticLayout clamps side-window positions into it.
+                {
+                    const auto size = display->getLayerStackSpaceRect().getSize();
+                    const float eyeAspect =
+                            size.height > 0
+                            ? static_cast<float>(size.width) /
+                                    static_cast<float>(size.height / 2)
+                            : 1.0f;
+                    const float vFovRadians =
+                            scene.fovDegrees * static_cast<float>(M_PI) / 180.0f;
+                    scene.horizontalFovDegrees =
+                            2.0f * std::atan(std::tan(vFovRadians * 0.5f) * eyeAspect) *
+                            180.0f / static_cast<float>(M_PI);
+                }
+                scene.spatialWindowLayer =
+                        base::GetProperty("debug.prismos.spatial_window_layer", "");
+                scene.spatialWindowDistanceMeters =
+                        getPrismFloatProperty("debug.prismos.spatial_window_distance",
+                                              scene.spatialWindowDistanceMeters);
+                scene.spatialWindowHeightMeters =
+                        getPrismFloatProperty("debug.prismos.spatial_window_height",
+                                              scene.spatialWindowHeightMeters);
+                scene.spatialWindowSuppressFlatCopy =
+                        !base::GetBoolProperty("debug.prismos.spatial_window_keep_flat", false);
+
+                scene.headTransform =
+                        base::GetBoolProperty("debug.prismos.head.override", false)
+                        ? getPrismDebugHeadTransform()
+                        : getPrismImuHeadTransform(*mPrismHeadTracker);
+                // Test environment: property defaults, overridden by the loaded packed scene
+                // (vrender / scene file). RenderEngine loads the referenced textures lazily.
+                scene.envEnabled =
+                        base::GetBoolProperty("debug.prismos.env.background", true);
+                scene.skyPath = base::GetProperty(
+                        "debug.prismos.env.sky", "/system/etc/prism_sky.raw");
+                scene.menuPath = base::GetProperty(
+                        "debug.prismos.env.menu", "/system/etc/prism_menu.raw");
+                {
+                    std::lock_guard sceneLock(mPrismSceneMutex);
+                    const auto& description = mPrismSceneDescription;
+                    if (description.loaded) {
+                        if (!description.skyPath.empty()) {
+                            scene.skyPath = description.skyPath;
+                        }
+                        if (!description.menuPath.empty()) {
+                            scene.menuPath = description.menuPath;
+                        }
+                        for (const auto& descQuad : description.quads) {
+                            if (!descQuad.visible) {
+                                continue;
+                            }
+                            renderengine::PrismEnvQuad envQuad;
+                            envQuad.name = descQuad.name;
+                            envQuad.texturePath = descQuad.texturePath;
+                            envQuad.centerX = descQuad.centerX;
+                            envQuad.centerY = descQuad.centerY;
+                            envQuad.distance = descQuad.distance;
+                            envQuad.height = descQuad.height;
+                            envQuad.yawDegrees = descQuad.yawDegrees;
+                            envQuad.visible = true;
+                            scene.envQuads.push_back(std::move(envQuad));
+                        }
+                    }
+                }
+                appendPrismWindowOverrides(&scene);
+                refreshArgs.prismScene = scene;
+                {
+                    std::lock_guard sceneLock(mPrismSceneMutex);
+                    mLastPrismScene = scene;
+                }
+            }
+        }
+#endif
     }
     mPowerAdvisor->setDisplays(displayIds);
     mDrawingState.traverseInZOrder([&refreshArgs](Layer* layer) {
@@ -2231,7 +2460,12 @@ void SurfaceFlinger::composite(nsecs_t frameTime, int64_t vsyncId)
         mDrawingState.colorMatrixChanged = false;
     }
 
-    refreshArgs.devOptForceClientComposition = mDebugDisableHWC;
+    // The stereo packing and the Prism scene live in the client-composition target: any layer
+    // handed to the hardware composer would bypass the eye packing and disappear from the
+    // world, so an active stereo plan keeps the whole frame on the client path.
+    refreshArgs.devOptForceClientComposition =
+            mDebugDisableHWC ||
+            (refreshArgs.stereoComposition && refreshArgs.stereoComposition->enabled);
 
     if (mDebugFlashDelay != 0) {
         refreshArgs.devOptForceClientComposition = true;
@@ -5038,6 +5272,9 @@ status_t SurfaceFlinger::doDump(int fd, const DumpArgs& args, bool asProto) {
                 {"--vsync"s, dumper(&SurfaceFlinger::dumpVSync)},
                 {"--wide-color"s, dumper(&SurfaceFlinger::dumpWideColorInfo)},
                 {"--frametimeline"s, argsDumper(&SurfaceFlinger::dumpFrameTimeline)},
+                {"vrender"s, [this](const DumpArgs& dumpArgs, bool, std::string& dumpResult) {
+                     vrenderCommand(dumpArgs, dumpResult);
+                 }},
         };
 
         const auto flag = args.empty() ? ""s : std::string(String8(args[0]));
@@ -5097,6 +5334,236 @@ status_t SurfaceFlinger::doDump(int fd, const DumpArgs& args, bool asProto) {
     }
     write(fd, result.c_str(), result.size());
     return NO_ERROR;
+}
+
+// PrismOS vrender: the runtime control surface for the spatial test environment. Invoked as
+// `dumpsys SurfaceFlinger vrender <command>`; every command takes effect on the next frame.
+//   status                              — print the loaded scene state
+//   scene load <file>                   — load a packed scene description
+//   scene off                           — unload the packed scene (property defaults return)
+//   sky <raw-path> | menu <raw-path>    — switch the backdrop / menu strip texture
+//   quad add <name> <tex> <x> <y> <dist> <height> [yaw]
+//   quad pos <name> <x> <y> <dist> | quad height <name> <h> | quad yaw <name> <deg>
+//   quad hide|show|remove <name>
+void SurfaceFlinger::vrenderCommand(const DumpArgs& args, std::string& result) {
+    const auto arg = [&args](size_t index) {
+        return index < args.size() ? std::string(String8(args[index]).c_str()) : std::string();
+    };
+    const auto toFloat = [](const std::string& text, float defaultValue) {
+        const float parsed = strtof(text.c_str(), nullptr);
+        return std::isfinite(parsed) ? parsed : defaultValue;
+    };
+
+    const std::string sub = arg(1);
+    std::lock_guard sceneLock(mPrismSceneMutex);
+    auto& description = mPrismSceneDescription;
+
+    if (sub == "legacy") {
+        const std::string action = arg(2);
+        if (action == "on" || action == "off") {
+            android::base::SetProperty("debug.prismos.legacy", action == "on" ? "1" : "0");
+            result = "PrismOS vrender: legacy mode " + action +
+                    " (stock Android rendering, spatial scene off)\n";
+            return;
+        }
+        StringAppendF(&result, "PrismOS vrender: legacy=%s\n",
+                      base::GetBoolProperty("debug.prismos.legacy", false) ? "on" : "off");
+        return;
+    }
+
+    if (sub == "flat") {
+        const std::string action = arg(2);
+        if (action == "on" || action == "off") {
+            android::base::SetProperty("debug.prismos.flat_layers",
+                                       action == "on" ? "1" : "0");
+            result = "PrismOS vrender: flat layers " + action +
+                    (action == "off"
+                             ? " (scene-only: sky, grid, quads, windows; no Android UI draws)"
+                             : " (Android UI drawn over the scene)") +
+                    "\n";
+            return;
+        }
+        StringAppendF(&result, "PrismOS vrender: flat_layers=%s\n",
+                      base::GetBoolProperty("debug.prismos.flat_layers", true) ? "on" : "off");
+        return;
+    }
+
+    if (sub == "status") {
+        StringAppendF(&result, "PrismOS vrender: scene %s\n",
+                      description.loaded ? "loaded" : "not loaded (property defaults)");
+        StringAppendF(&result, "  sky:  %s\n", description.skyPath.c_str());
+        StringAppendF(&result, "  menu: %s\n", description.menuPath.c_str());
+        StringAppendF(&result, "  quads: %zu\n", description.quads.size());
+        for (const auto& quad : description.quads) {
+            StringAppendF(&result,
+                          "    %s tex=%s pos=(%.2f, %.2f, dist=%.2f) height=%.2f yaw=%.0f%s\n",
+                          quad.name.c_str(), quad.texturePath.c_str(), quad.centerX, quad.centerY,
+                          quad.distance, quad.height, quad.yawDegrees,
+                          quad.visible ? "" : " (hidden)");
+        }
+        return;
+    }
+
+    if (sub == "scene") {
+        const std::string action = arg(2);
+        if (action == "load") {
+            const std::string path = arg(3);
+            if (loadPrismSceneFileLocked(path, result)) {
+                StringAppendF(&result, "PrismOS vrender: scene loaded from %s\n", path.c_str());
+            }
+            return;
+        }
+        if (action == "off") {
+            description.loaded = false;
+            result = "PrismOS vrender: scene unloaded (property defaults active)\n";
+            return;
+        }
+        result = "usage: vrender scene load <file> | vrender scene off\n";
+        return;
+    }
+
+    if (sub == "sky") {
+        description.skyPath = arg(2);
+        description.loaded = true;
+        result = "PrismOS vrender: sky = " + description.skyPath + "\n";
+        return;
+    }
+    if (sub == "menu") {
+        description.menuPath = arg(2);
+        description.loaded = true;
+        result = "PrismOS vrender: menu = " + description.menuPath + "\n";
+        return;
+    }
+
+    if (sub == "quad") {
+        const std::string action = arg(2);
+        if (action == "add") {
+            PrismSceneDescription::Quad quad;
+            quad.name = arg(3);
+            quad.texturePath = arg(4);
+            quad.centerX = toFloat(arg(5), 0.0f);
+            quad.centerY = toFloat(arg(6), 0.0f);
+            quad.distance = toFloat(arg(7), 2.0f);
+            quad.height = toFloat(arg(8), 0.5f);
+            quad.yawDegrees = toFloat(arg(9), 0.0f);
+            if (quad.name.empty() || quad.texturePath.empty()) {
+                result = "usage: vrender quad add <name> <texPath> <x> <y> <dist> <height> "
+                         "[yaw]\n";
+                return;
+            }
+            description.quads.erase(
+                    std::remove_if(description.quads.begin(), description.quads.end(),
+                                   [&quad](const auto& existing) {
+                                       return existing.name == quad.name;
+                                   }),
+                    description.quads.end());
+            description.quads.push_back(std::move(quad));
+            description.loaded = true;
+            result = "PrismOS vrender: quad added\n";
+            return;
+        }
+        const std::string name = arg(3);
+        auto quadIt = std::find_if(description.quads.begin(), description.quads.end(),
+                                   [&name](const auto& existing) { return existing.name == name; });
+        if (quadIt == description.quads.end()) {
+            StringAppendF(&result, "PrismOS vrender: quad '%s' not found\n", name.c_str());
+            return;
+        }
+        if (action == "pos") {
+            quadIt->centerX = toFloat(arg(4), quadIt->centerX);
+            quadIt->centerY = toFloat(arg(5), quadIt->centerY);
+            quadIt->distance = toFloat(arg(6), quadIt->distance);
+            result = "PrismOS vrender: quad pos updated\n";
+            return;
+        }
+        if (action == "height") {
+            quadIt->height = toFloat(arg(4), quadIt->height);
+            result = "PrismOS vrender: quad height updated\n";
+            return;
+        }
+        if (action == "yaw") {
+            quadIt->yawDegrees = toFloat(arg(4), quadIt->yawDegrees);
+            result = "PrismOS vrender: quad yaw updated\n";
+            return;
+        }
+        if (action == "hide" || action == "show") {
+            quadIt->visible = action == "show";
+            result = "PrismOS vrender: quad " + action + "d\n";
+            return;
+        }
+        if (action == "remove") {
+            description.quads.erase(quadIt);
+            result = "PrismOS vrender: quad removed\n";
+            return;
+        }
+        result = "usage: vrender quad add|pos|height|yaw|hide|show|remove ...\n";
+        return;
+    }
+
+    result = "PrismOS vrender commands:\n"
+             "  status\n"
+             "  scene load <file> | scene off\n"
+             "  sky <raw-path> | menu <raw-path>\n"
+             "  quad add <name> <tex> <x> <y> <dist> <height> [yaw]\n"
+             "  quad pos <name> <x> <y> <dist> | quad height <name> <h> | quad yaw <name> <deg>\n"
+             "  quad hide|show|remove <name>\n";
+}
+
+bool SurfaceFlinger::loadPrismSceneFileLocked(const std::string& path, std::string& result) {
+    std::ifstream file(path);
+    if (!file) {
+        result = "PrismOS vrender: cannot open " + path + "\n";
+        return false;
+    }
+
+    PrismSceneDescription parsed;
+    parsed.loaded = true;
+    std::string line;
+    int lineNo = 0;
+    while (std::getline(file, line)) {
+        ++lineNo;
+        const size_t comment = line.find('#');
+        if (comment != std::string::npos) {
+            line = line.substr(0, comment);
+        }
+        std::istringstream tokenizer(line);
+        std::vector<std::string> tokens;
+        std::string token;
+        while (tokenizer >> token) {
+            tokens.push_back(token);
+        }
+        if (tokens.empty()) {
+            continue;
+        }
+        if (tokens[0] == "sky" && tokens.size() >= 2) {
+            parsed.skyPath = tokens[1];
+        } else if (tokens[0] == "menu" && tokens.size() >= 2) {
+            parsed.menuPath = tokens[1];
+        } else if (tokens[0] == "quad" && tokens.size() >= 7) {
+            PrismSceneDescription::Quad quad;
+            quad.name = tokens[1];
+            quad.texturePath = tokens[2];
+            quad.centerX = strtof(tokens[3].c_str(), nullptr);
+            quad.centerY = strtof(tokens[4].c_str(), nullptr);
+            quad.distance = strtof(tokens[5].c_str(), nullptr);
+            quad.height = strtof(tokens[6].c_str(), nullptr);
+            if (tokens.size() >= 8) {
+                quad.yawDegrees = strtof(tokens[7].c_str(), nullptr);
+            }
+            parsed.quads.erase(
+                    std::remove_if(parsed.quads.begin(), parsed.quads.end(),
+                                   [&quad](const auto& existing) {
+                                       return existing.name == quad.name;
+                                   }),
+                    parsed.quads.end());
+            parsed.quads.push_back(std::move(quad));
+        } else {
+            StringAppendF(&result, "PrismOS vrender: %s:%d ignored (unknown directive)\n",
+                          path.c_str(), lineNo);
+        }
+    }
+    mPrismSceneDescription = std::move(parsed);
+    return true;
 }
 
 status_t SurfaceFlinger::dumpCritical(int fd, const DumpArgs&, bool asProto) {
@@ -6683,10 +7150,18 @@ ftl::SharedFuture<FenceResult> SurfaceFlinger::captureScreenCommon(
             (hasProtectedLayer && allowProtected && supportsProtected
                      ? GRALLOC_USAGE_PROTECTED
                      : GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN);
+    // PrismOS: the QTI gralloc/Adreno combination may allocate SW-usage capture buffers in a
+    // layout whose EGLImage does not render (the capture FBO stays silently black). When the
+    // gate is on, allocate the capture target as a pure GPU buffer instead. Remove after the
+    // capture path is fixed.
+    const uint32_t captureUsage =
+            base::GetBoolProperty("debug.prismos.env.capture_hw_only", false)
+            ? (usage & ~(GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN))
+            : usage;
     sp<GraphicBuffer> buffer =
             getFactory().createGraphicBuffer(bufferSize.getWidth(), bufferSize.getHeight(),
                                              static_cast<android_pixel_format>(reqPixelFormat),
-                                             1 /* layerCount */, usage, "screenshot");
+                                             1 /* layerCount */, captureUsage, "screenshot");
 
     const status_t bufferStatus = buffer->initCheck();
     if (bufferStatus != OK) {
@@ -6900,12 +7375,35 @@ ftl::SharedFuture<FenceResult> SurfaceFlinger::renderScreenImpl(
     base::unique_fd bufferFence;
     getRenderEngine().useProtectedContext(useProtected);
 
+    // PrismOS: when the spatial scene is active the panel shows the scene, so a capture of
+    // the whole display must render the scene too (screencap, scrcpy). Region samplers and
+    // partial captures keep the flat path. The scene was built by composite() for the
+    // current frame and is cached under mPrismSceneMutex.
+    renderengine::PrismSceneSettings captureScene;
+    {
+        std::lock_guard sceneLock(mPrismSceneMutex);
+        captureScene = mLastPrismScene;
+    }
+    // Captures show a single centered view — what the wearer sees — not the stereo pair.
+    // debug.prismos.capture.stereo=1 switches the capture back to the SBS pair.
+    captureScene.monoView = !base::GetBoolProperty("debug.prismos.capture.stereo", false);
+    const bool sceneCapture = captureScene.enabled && display &&
+            reqWidth == static_cast<int>(display->getLayerStackSpaceRect().getWidth()) &&
+            reqHeight == static_cast<int>(display->getLayerStackSpaceRect().getHeight());
+
     constexpr bool kUseFramebufferCache = false;
-    auto chain =
-            ftl::Future(getRenderEngine().drawLayers(clientCompositionDisplay,
-                                                     clientRenderEngineLayers, buffer,
-                                                     kUseFramebufferCache, std::move(bufferFence)))
-                    .then(&toFenceResult);
+    std::future<renderengine::RenderEngineResult> renderResultFuture;
+    if (sceneCapture) {
+        renderResultFuture = getRenderEngine().drawLayersWithPrismScene(
+                clientCompositionDisplay, clientRenderEngineLayers, buffer, kUseFramebufferCache,
+                std::move(bufferFence), captureScene);
+    } else {
+        renderResultFuture = getRenderEngine().drawLayers(clientCompositionDisplay,
+                                                          clientRenderEngineLayers, buffer,
+                                                          kUseFramebufferCache,
+                                                          std::move(bufferFence));
+    }
+    auto chain = ftl::Future(std::move(renderResultFuture)).then(&toFenceResult);
 
     const auto future = chain.share();
     for (auto* layer : renderedLayers) {

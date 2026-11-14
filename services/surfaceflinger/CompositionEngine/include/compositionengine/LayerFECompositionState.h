@@ -153,6 +153,13 @@ struct LayerFECompositionState {
 
     GenericLayerMetadataMap metadata;
 
+    // PrismOS: this layer is explicitly marked as a world-space window by WindowManager.
+    bool prismSpatialWindow{false};
+
+    // PrismOS: stable per-activity identity (WindowManager layer metadata key 10001), used by
+    // RenderEngine to key placement memory across surface recreation. Zero when absent.
+    int32_t prismSpatialWindowId{0};
+
     /*
      * Per-frame content
      */

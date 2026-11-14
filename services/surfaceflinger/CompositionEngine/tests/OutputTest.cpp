@@ -3538,6 +3538,171 @@ TEST_F(OutputComposeSurfacesTest, handlesZeroCompositionRequests) {
     verify().execute().expectAFenceWasReturned();
 }
 
+TEST_F(OutputComposeSurfacesTest, stereoPlanExpandsOneLayerSetIntoTwoPackedViews) {
+    // Set the source of Output::composeSurfaces()' DisplaySettings.clip
+    // explicitly. The production method copies this value into the exact
+    // DisplaySettings object passed to RenderEngine::drawLayers().
+    const Rect stereoClip{1005, 1006, 1007, 1008};
+    mOutput.mState.layerStackSpace.setContent(stereoClip);
+
+    LayerFE::LayerSettings source;
+    source.geometry.boundaries = FloatRect{1, 2, 3, 4};
+
+    compositionengine::CompositionRefreshArgs stereoRefreshArgs;
+    compositionengine::StereoCompositionPlan stereoPlan;
+    stereoPlan.enabled = true;
+    stereoRefreshArgs.stereoComposition = stereoPlan;
+
+    EXPECT_CALL(mOutput, getSkipColorTransform()).WillRepeatedly(Return(false));
+    EXPECT_CALL(*mDisplayColorProfile, hasWideColorGamut()).WillRepeatedly(Return(true));
+    EXPECT_CALL(mRenderEngine, supportsProtectedContent()).WillRepeatedly(Return(false));
+    EXPECT_CALL(mRenderEngine, isProtected()).WillRepeatedly(Return(false));
+    EXPECT_CALL(mOutput, generateClientCompositionRequests(_, kDefaultOutputDataspace, _))
+            .WillOnce(Return(std::vector<LayerFE::LayerSettings>{source}));
+    EXPECT_CALL(mOutput, appendRegionFlashRequests(RegionEq(kDebugRegion), _))
+            .WillOnce(Return());
+
+    EXPECT_CALL(mRenderEngine, drawLayers(_, _, _, false, _))
+            .WillOnce(Invoke([](const renderengine::DisplaySettings& display,
+                                const std::vector<renderengine::LayerSettings>& layers,
+                                const std::shared_ptr<renderengine::ExternalTexture>&, const bool,
+                                base::unique_fd&&)
+                                      -> std::future<renderengine::RenderEngineResult> {
+                EXPECT_EQ(layers.size(), 2u);
+                if (layers.size() != 2u) {
+                    return futureOf<renderengine::RenderEngineResult>(
+                            {NO_ERROR, base::unique_fd()});
+                }
+                EXPECT_NE(layers[0].geometry.positionTransform,
+                          layers[1].geometry.positionTransform);
+
+                EXPECT_EQ(display.clip.left, 1005);
+                EXPECT_EQ(display.clip.right, 1007);
+                EXPECT_EQ(display.clip.top, 1006);
+                EXPECT_EQ(display.clip.bottom, 1008);
+
+                // The test clip is deliberately non-zero: [1005, 1007].
+                // Before the common display projection, the left transform
+                // maps the logical interval to [left, midpoint] and the
+                // right transform maps it to [midpoint, right].
+                const float left = static_cast<float>(display.clip.left);
+                const float right = static_cast<float>(display.clip.right);
+                const float midpoint = (left + right) * 0.5f;
+                const auto mapX = [](const mat4& transform, float x) {
+                    return (transform * vec4(x, 0.0f, 0.0f, 1.0f))[0];
+                };
+                EXPECT_FLOAT_EQ(mapX(layers[0].geometry.positionTransform, left), left);
+                EXPECT_FLOAT_EQ(mapX(layers[0].geometry.positionTransform, right), midpoint);
+                EXPECT_FLOAT_EQ(mapX(layers[1].geometry.positionTransform, left), midpoint);
+                EXPECT_FLOAT_EQ(mapX(layers[1].geometry.positionTransform, right), right);
+
+                return futureOf<renderengine::RenderEngineResult>({NO_ERROR, base::unique_fd()});
+            }));
+
+    base::unique_fd fence;
+    mOutput.composeSurfaces(kDebugRegion, stereoRefreshArgs, mOutputBuffer, fence);
+}
+
+TEST_F(OutputComposeSurfacesTest, prismScenePassKeepsOneOutputAndOneLayerTarget) {
+    mOutput.mState.layerStackSpace.setContent(Rect{0, 0, 1080, 2248});
+
+    LayerFE::LayerSettings source;
+    source.geometry.boundaries = FloatRect{1, 2, 3, 4};
+
+    compositionengine::CompositionRefreshArgs refreshArgs;
+    compositionengine::StereoCompositionPlan stereoPlan;
+    stereoPlan.enabled = true;
+    renderengine::PrismSceneSettings scene;
+    scene.enabled = true;
+    refreshArgs.stereoComposition = stereoPlan;
+    refreshArgs.prismScene = scene;
+
+    EXPECT_CALL(mOutput, getSkipColorTransform()).WillRepeatedly(Return(false));
+    EXPECT_CALL(*mDisplayColorProfile, hasWideColorGamut()).WillRepeatedly(Return(true));
+    EXPECT_CALL(mRenderEngine, supportsProtectedContent()).WillRepeatedly(Return(false));
+    EXPECT_CALL(mRenderEngine, isProtected()).WillRepeatedly(Return(false));
+    EXPECT_CALL(mOutput, generateClientCompositionRequests(_, kDefaultOutputDataspace, _))
+            .WillOnce(Return(std::vector<LayerFE::LayerSettings>{source}));
+    EXPECT_CALL(mOutput, appendRegionFlashRequests(RegionEq(kDebugRegion), _))
+            .WillOnce(Return());
+
+    EXPECT_CALL(mRenderEngine, drawLayersWithPrismScene(_, _, _, false, _, _))
+            .WillOnce(Invoke([](const renderengine::DisplaySettings&,
+                                const std::vector<renderengine::LayerSettings>& layers,
+                                const std::shared_ptr<renderengine::ExternalTexture>&, const bool,
+                                base::unique_fd&&,
+                                const renderengine::PrismSceneSettings& sceneSettings)
+                                      -> std::future<renderengine::RenderEngineResult> {
+                EXPECT_EQ(layers.size(), 2u);
+                EXPECT_TRUE(sceneSettings.enabled);
+                EXPECT_FLOAT_EQ(sceneSettings.ipd, 0.064f);
+                EXPECT_FLOAT_EQ(sceneSettings.fovDegrees, 90.0f);
+                EXPECT_FLOAT_EQ(sceneSettings.nearPlane, 0.05f);
+                EXPECT_FLOAT_EQ(sceneSettings.farPlane, 100.0f);
+                return futureOf<renderengine::RenderEngineResult>({NO_ERROR, base::unique_fd()});
+            }));
+
+    base::unique_fd fence;
+    mOutput.composeSurfaces(kDebugRegion, refreshArgs, mOutputBuffer, fence);
+}
+
+TEST_F(OutputComposeSurfacesTest, prismScenePassKeepsWindowIdentityAcrossEyeCopies) {
+    mOutput.mState.layerStackSpace.setContent(Rect{0, 0, 1080, 2248});
+
+    LayerFE::LayerSettings spatial;
+    spatial.geometry.boundaries = FloatRect{1, 2, 3, 4};
+    spatial.prismSpatialWindow = true;
+    spatial.prismSpatialWindowId = 4242;
+    spatial.name = "Settings#12";
+    LayerFE::LayerSettings flat;
+    flat.geometry.boundaries = FloatRect{5, 6, 7, 8};
+
+    compositionengine::CompositionRefreshArgs refreshArgs;
+    compositionengine::StereoCompositionPlan stereoPlan;
+    stereoPlan.enabled = true;
+    renderengine::PrismSceneSettings scene;
+    scene.enabled = true;
+    scene.spatialWindowEnabled = true;
+    refreshArgs.stereoComposition = stereoPlan;
+    refreshArgs.prismScene = scene;
+
+    EXPECT_CALL(mOutput, getSkipColorTransform()).WillRepeatedly(Return(false));
+    EXPECT_CALL(*mDisplayColorProfile, hasWideColorGamut()).WillRepeatedly(Return(true));
+    EXPECT_CALL(mRenderEngine, supportsProtectedContent()).WillRepeatedly(Return(false));
+    EXPECT_CALL(mRenderEngine, isProtected()).WillRepeatedly(Return(false));
+    EXPECT_CALL(mOutput, generateClientCompositionRequests(_, kDefaultOutputDataspace, _))
+            .WillOnce(Return(std::vector<LayerFE::LayerSettings>{spatial, flat}));
+    EXPECT_CALL(mOutput, appendRegionFlashRequests(RegionEq(kDebugRegion), _))
+            .WillOnce(Return());
+
+    EXPECT_CALL(mRenderEngine, drawLayersWithPrismScene(_, _, _, false, _, _))
+            .WillOnce(Invoke([](const renderengine::DisplaySettings&,
+                                const std::vector<renderengine::LayerSettings>& layers,
+                                const std::shared_ptr<renderengine::ExternalTexture>&, const bool,
+                                base::unique_fd&&,
+                                const renderengine::PrismSceneSettings&)
+                                      -> std::future<renderengine::RenderEngineResult> {
+                // Two sources, each packed into an eye copy: left eye first, right eye second.
+                ASSERT_EQ(layers.size(), 4u);
+                for (const auto& layer : layers) {
+                    if (layer.name == "Settings#12") {
+                        EXPECT_TRUE(layer.prismSpatialWindow);
+                        EXPECT_EQ(layer.prismSpatialWindowId, 4242);
+                    } else {
+                        EXPECT_FALSE(layer.prismSpatialWindow);
+                        EXPECT_EQ(layer.prismSpatialWindowId, 0);
+                    }
+                }
+                EXPECT_EQ(layers[0].name, layers[2].name);
+                EXPECT_EQ(layers[0].prismSpatialWindowId, layers[2].prismSpatialWindowId);
+                EXPECT_EQ(layers[1].name, layers[3].name);
+                return futureOf<renderengine::RenderEngineResult>({NO_ERROR, base::unique_fd()});
+            }));
+
+    base::unique_fd fence;
+    mOutput.composeSurfaces(kDebugRegion, refreshArgs, mOutputBuffer, fence);
+}
+
 TEST_F(OutputComposeSurfacesTest, buildsAndRendersRequestList) {
     LayerFE::LayerSettings r1;
     LayerFE::LayerSettings r2;

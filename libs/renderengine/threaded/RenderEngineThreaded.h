@@ -62,6 +62,11 @@ public:
                                                const bool useFramebufferCache,
                                                base::unique_fd&& bufferFence) override;
 
+    std::future<RenderEngineResult> drawLayersWithPrismScene(
+            const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+            const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
+            base::unique_fd&& bufferFence, const PrismSceneSettings& scene) override;
+
     void cleanFramebufferCache() override;
     int getContextPriority() override;
     bool supportsBackgroundBlur() override;

@@ -447,6 +447,13 @@ void Layer::prepareGeometryCompositionState() {
     compositionState->geomUsesSourceCrop = usesSourceCrop();
     compositionState->isSecure = isSecure();
 
+    // Custom metadata keys 10000 and 10001 are reserved for PrismOS and are not HWC generic
+    // keys. 10000 tags a world-space window; 10001 carries its stable per-activity identity.
+    compositionState->prismSpatialWindow =
+            drawingState.metadata.getInt32(10000, 0) != 0;
+    compositionState->prismSpatialWindowId =
+            drawingState.metadata.getInt32(10001, 0);
+
     compositionState->metadata.clear();
     const auto& supportedMetadata = mFlinger->getHwComposer().getSupportedLayerGenericMetadata();
     for (const auto& [key, mandatory] : supportedMetadata) {
@@ -632,6 +639,8 @@ std::optional<compositionengine::LayerFE::LayerSettings> Layer::prepareClientCom
             break;
     }
     layerSettings.stretchEffect = getStretchEffect();
+    layerSettings.prismSpatialWindow = getCompositionState()->prismSpatialWindow;
+    layerSettings.prismSpatialWindowId = getCompositionState()->prismSpatialWindowId;
     // Record the name of the layer for debugging further down the stack.
     layerSettings.name = getName();
     return layerSettings;

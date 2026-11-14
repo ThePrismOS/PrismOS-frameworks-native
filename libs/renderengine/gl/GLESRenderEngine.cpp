@@ -21,6 +21,7 @@
 #define ATRACE_TAG ATRACE_TAG_GRAPHICS
 
 #include <sched.h>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -28,11 +29,14 @@
 
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#include <android-base/properties.h>
+#include <array>
 #include <android-base/stringprintf.h>
 #include <cutils/compiler.h>
 #include <cutils/properties.h>
 #include <gui/DebugEGLImageTracker.h>
 #include <renderengine/Mesh.h>
+#include <renderengine/PrismSpatialLayout.h>
 #include <renderengine/Texture.h>
 #include <renderengine/private/Description.h>
 #include <sync/sync.h>
@@ -139,6 +143,127 @@ private:
 
 using base::StringAppendF;
 using ui::Dataspace;
+
+namespace {
+
+// PrismOS environment helper: float property with a default for empty/unparseable values.
+float prismFloatProperty(const char* key, float defaultValue) {
+    const std::string value = base::GetProperty(key, "");
+    if (value.empty()) {
+        return defaultValue;
+    }
+    const float parsed = strtof(value.c_str(), nullptr);
+    return std::isfinite(parsed) ? parsed : defaultValue;
+}
+
+// PrismOS scene geometry, drawn through client-side arrays (the proven draw path on this
+// driver — VBO-based draws of the environment silently do not render). The grid spans
+// ±15m so it covers the whole eye FOV: at the 6m wall distance the visible half-width is
+// ~7m, and a ±5m grid left the eye edges without reference lines.
+constexpr size_t kPrismGridLines = 21;
+constexpr size_t kPrismGridVertexCount = kPrismGridLines * 2 * 2;  // 2 directions, 2 points
+constexpr size_t kPrismGridStrideFloats = 7;  // x, y, z, r, g, b, a
+const std::array<GLfloat, kPrismGridVertexCount * kPrismGridStrideFloats> kPrismGridData = [] {
+    std::array<GLfloat, kPrismGridVertexCount * kPrismGridStrideFloats> grid{};
+    size_t i = 0;
+    constexpr float kGridExtent = 15.0f;
+    constexpr float kGridStep = 1.5f;
+    constexpr float kGridDepth = -6.0f;
+    for (size_t line = 0; line < kPrismGridLines; ++line) {
+        const float fv = -kGridExtent + static_cast<float>(line) * kGridStep;
+        grid[i++] = fv;         grid[i++] = -kGridExtent; grid[i++] = kGridDepth;
+        grid[i++] = 0.18f; grid[i++] = 0.25f; grid[i++] = 0.35f; grid[i++] = 1.0f;
+        grid[i++] = fv;         grid[i++] = kGridExtent;  grid[i++] = kGridDepth;
+        grid[i++] = 0.18f; grid[i++] = 0.25f; grid[i++] = 0.35f; grid[i++] = 1.0f;
+        grid[i++] = -kGridExtent; grid[i++] = fv;       grid[i++] = kGridDepth;
+        grid[i++] = 0.18f; grid[i++] = 0.25f; grid[i++] = 0.35f; grid[i++] = 1.0f;
+        grid[i++] = kGridExtent;  grid[i++] = fv;       grid[i++] = kGridDepth;
+        grid[i++] = 0.18f; grid[i++] = 0.25f; grid[i++] = 0.35f; grid[i++] = 1.0f;
+    }
+    return grid;
+}();
+constexpr GLfloat kPrismSkyQuadPositions[] = {-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
+// The unit world quad: x,y in [-0.5, 0.5], z = 0; uv with v=0 at the top.
+constexpr GLfloat kPrismWorldQuadVertices[] = {
+        -0.5f, -0.5f, 0.0f, 0.0f, 1.0f,
+         0.5f, -0.5f, 0.0f, 1.0f, 1.0f,
+        -0.5f,  0.5f, 0.0f, 0.0f, 0.0f,
+         0.5f,  0.5f, 0.0f, 1.0f, 0.0f,
+};
+
+GLuint compilePrismShader(GLenum type, const char* source) {
+    const GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+
+    GLint compiled = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (compiled == GL_FALSE) {
+        char log[512] = {};
+        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+        ALOGE("PrismOS scene shader compilation failed: %s", log);
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+bool prismLayerHasBuffer(const LayerSettings& layer) {
+    return layer.source.buffer.buffer != nullptr &&
+            layer.source.buffer.buffer->getBuffer() != nullptr;
+}
+
+// The spatial window only takes over layers that the regular path would blit verbatim; layers
+// that drive the blur pipeline stay on the flat path. A tagged window whose 2D visible region
+// is empty (another activity covered it) is still a candidate and keeps its last buffer in the
+// world: background apps must remain spatially visible for multitasking, while the flat path
+// continues to honor skipContentDraw for them.
+bool prismLayerIsSpatialCandidate(const LayerSettings& layer) {
+    return prismLayerHasBuffer(layer) && layer.backgroundBlurRadius <= 0 &&
+            layer.blurRegions.empty();
+}
+
+// Layer names carry a "#<sequence>" suffix that changes between boots, so an exact match is
+// accepted as well as the stable prefix in front of that suffix.
+bool prismLayerNameMatches(const std::string& layerName, const std::string& requested) {
+    if (requested.empty() || layerName.empty()) {
+        return false;
+    }
+    if (layerName == requested) {
+        return true;
+    }
+    return layerName.size() > requested.size() &&
+            layerName.compare(0, requested.size(), requested) == 0 &&
+            layerName[requested.size()] == '#';
+}
+
+const PrismSpatialWindowSettings* findPrismSpatialWindowSettings(
+        const PrismSceneSettings& scene, const std::string& layerName) {
+    for (const auto& settings : scene.spatialWindows) {
+        if (prismLayerNameMatches(layerName, settings.id)) {
+            return &settings;
+        }
+    }
+    return nullptr;
+}
+
+// Prism spatialization is intentionally opt-in. WindowManager marks only buffer-bearing main
+// application surfaces, while the legacy name selector bridges frames before metadata arrives.
+// There is no largest-buffer fallback: a container, shadow, or system surface must never become a
+// spatial window merely because it has the biggest buffer.
+bool isPrismSpatialLayerSelected(const LayerSettings& layer, const PrismSceneSettings& scene,
+                                 bool hasTaggedLayers) {
+    if (!prismLayerIsSpatialCandidate(layer)) {
+        return false;
+    }
+    if (layer.prismSpatialWindow) {
+        return true;
+    }
+    return !hasTaggedLayers && !scene.spatialWindowLayer.empty() &&
+            prismLayerNameMatches(layer.name, scene.spatialWindowLayer);
+}
+
+} // namespace
 
 static status_t selectConfigForAttribute(EGLDisplay dpy, EGLint const* attrs, EGLint attribute,
                                          EGLint wanted, EGLConfig* outConfig) {
@@ -482,6 +607,7 @@ GLESRenderEngine::~GLESRenderEngine() {
     ProgramCache::getInstance().purgeCaches();
     std::lock_guard<std::mutex> lock(mRenderingMutex);
     glDisableVertexAttribArray(Program::position);
+    destroyPrismScene();
     unbindFrameBuffer(mDrawingBuffer.get());
     mDrawingBuffer = nullptr;
     eglDestroyImageKHR(mEGLDisplay, mPlaceholderImage);
@@ -1079,13 +1205,1139 @@ EGLImageKHR GLESRenderEngine::createFramebufferImageIfNeeded(ANativeWindowBuffer
     return image;
 }
 
+uint32_t GLESRenderEngine::nextFreePrismLayoutSlot() const {
+    std::unordered_set<uint32_t> usedSlots;
+    usedSlots.reserve(mPrismSpatialWindowStates.size());
+    for (const auto& [_, state] : mPrismSpatialWindowStates) {
+        usedSlots.insert(state.automaticLayoutSlot);
+    }
+    uint32_t slot = 0;
+    while (usedSlots.count(slot) > 0) {
+        ++slot;
+    }
+    return slot;
+}
+
+std::vector<GLESRenderEngine::PrismSpatialLayer> GLESRenderEngine::resolvePrismSpatialLayers(
+        const std::vector<LayerSettings>& layers, const PrismSceneSettings& scene) {
+    std::vector<PrismSpatialLayer> resolved;
+    if (!scene.spatialWindowEnabled) {
+        return resolved;
+    }
+
+    const uint64_t frame = ++mPrismSceneFrame;
+    const bool hasTaggedLayers = std::any_of(layers.begin(), layers.end(),
+                                             [](const LayerSettings& layer) {
+                                                 return layer.prismSpatialWindow;
+                                             });
+    // PrismOS bring-up diagnostics: once per second, report why tagged layers fail selection.
+    if (frame % 60 == 1) {
+        std::string diag = "layers=" + std::to_string(layers.size()) +
+                " tagged=" + std::to_string(hasTaggedLayers);
+        for (const auto& layer : layers) {
+            if (!prismLayerHasBuffer(layer)) continue;
+            diag += " | '" + layer.name + "' tag=" +
+                    std::to_string(layer.prismSpatialWindow) + " skipDraw=" +
+                    std::to_string(layer.skipContentDraw) + " blur=" +
+                    std::to_string(layer.backgroundBlurRadius) + " id=" +
+                    std::to_string(layer.prismSpatialWindowId);
+        }
+        ALOGD("PrismOS resolve: %s", diag.c_str());
+    }
+    for (const auto& layer : layers) {
+        if (layer.prismSpatialWindow && !prismLayerIsSpatialCandidate(layer)) {
+            ALOGV("PrismOS spatial window '%s' is temporarily unavailable: no usable buffer",
+                  layer.name.c_str());
+            auto state = mPrismSpatialWindowStates.find(
+                    prism::spatialStateKey(layer.prismSpatialWindowId, layer.name));
+            if (state != mPrismSpatialWindowStates.end()) {
+                state->second.lastSeenFrame = frame;
+            }
+            continue;
+        }
+        if (!isPrismSpatialLayerSelected(layer, scene, hasTaggedLayers) || layer.name.empty()) {
+            continue;
+        }
+
+        // The stereo packing emits two eye copies of every layer, sharing name, window id, and
+        // buffer. Placement state persists across frames (an app switched away and back keeps
+        // its slot), so frame-resolved dedup is keyed per frame: deduping on the map insert
+        // alone would resolve a window only on the single frame its state was created.
+        const std::string stateKey =
+                prism::spatialStateKey(layer.prismSpatialWindowId, layer.name);
+        auto [state, inserted] = mPrismSpatialWindowStates.try_emplace(stateKey);
+        if (inserted) {
+            const sp<GraphicBuffer> buffer = layer.source.buffer.buffer->getBuffer();
+            const uint32_t slot = nextFreePrismLayoutSlot();
+            state->second.settings =
+                    prism::automaticLayout(slot, static_cast<float>(buffer->getWidth()),
+                                           static_cast<float>(buffer->getHeight()), scene);
+            state->second.settings.id = layer.name;
+            state->second.automaticLayoutSlot = slot;
+        }
+        state->second.lastSeenFrame = frame;
+        if (state->second.lastResolvedFrame == frame) {
+            // The second SBS eye copy of the same window this frame: the scene draws each
+            // window once per eye, so a second entry would double-blend it.
+            continue;
+        }
+        state->second.lastResolvedFrame = frame;
+
+        // Overrides are merged every frame so property-driven moves apply to windows that are
+        // already seated; without one, the automatic layout is kept.
+        PrismSpatialWindowSettings effective = state->second.settings;
+        if (const auto* settingsOverride = findPrismSpatialWindowSettings(scene, layer.name)) {
+            effective = *settingsOverride;
+            effective.id = layer.name;
+        }
+        resolved.push_back({&layer, std::move(effective)});
+    }
+
+    for (auto state = mPrismSpatialWindowStates.begin();
+         state != mPrismSpatialWindowStates.end();) {
+        if (frame - state->second.lastSeenFrame > scene.spatialWindowPlacementRetentionFrames) {
+            ALOGI("PrismOS spatial window placement '%s' expired; freeing its layout slot",
+                  state->first.c_str());
+            state = mPrismSpatialWindowStates.erase(state);
+        } else {
+            ++state;
+        }
+    }
+    return resolved;
+}
+
+bool GLESRenderEngine::initializePrismScene() {
+    if (mPrismSceneProgram != 0) {
+        return true;
+    }
+
+    static constexpr const char* kVertexShader = R"(
+        attribute vec3 position;
+        attribute vec4 color;
+        uniform mat4 mvp;
+        varying lowp vec4 vColor;
+        void main() {
+            gl_Position = mvp * vec4(position, 1.0);
+            vColor = color;
+        }
+    )";
+    static constexpr const char* kFragmentShader = R"(
+        precision mediump float;
+        varying lowp vec4 vColor;
+        void main() {
+            gl_FragColor = vColor;
+        }
+    )";
+
+    const GLuint vertexShader = compilePrismShader(GL_VERTEX_SHADER, kVertexShader);
+    const GLuint fragmentShader = compilePrismShader(GL_FRAGMENT_SHADER, kFragmentShader);
+    if (vertexShader == 0 || fragmentShader == 0) {
+        if (vertexShader != 0) glDeleteShader(vertexShader);
+        if (fragmentShader != 0) glDeleteShader(fragmentShader);
+        return false;
+    }
+
+    const GLuint program = glCreateProgram();
+    glAttachShader(program, vertexShader);
+    glAttachShader(program, fragmentShader);
+    glLinkProgram(program);
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    GLint linked = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (linked == GL_FALSE) {
+        char log[512] = {};
+        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+        ALOGE("PrismOS scene program link failed: %s", log);
+        glDeleteProgram(program);
+        return false;
+    }
+
+    mPrismSceneMvpLocation = glGetUniformLocation(program, "mvp");
+    mPrismScenePositionLocation = glGetAttribLocation(program, "position");
+    mPrismSceneColorLocation = glGetAttribLocation(program, "color");
+    if (mPrismSceneMvpLocation < 0 || mPrismScenePositionLocation < 0 ||
+        mPrismSceneColorLocation < 0) {
+        ALOGE("PrismOS scene program is missing an attribute or uniform");
+        glDeleteProgram(program);
+        mPrismSceneMvpLocation = -1;
+        mPrismScenePositionLocation = -1;
+        mPrismSceneColorLocation = -1;
+        return false;
+    }
+
+    // PrismOS: the reference grid — the only decorative geometry, drawn every frame with the
+    // scene program. It doubles as a "scene reaches the panel" marker. The early bring-up
+    // cube buffer was removed: leaving it bound to GL_ARRAY_BUFFER after this function made
+    // every later client-pointer draw in the scene read vertices from it, which rendered the
+    // whole world empty.
+    std::vector<GLfloat> grid;
+    grid.reserve(44 * 7);
+    const auto addGridVertex = [](std::vector<GLfloat>& vertices, float x, float y, float z) {
+        vertices.insert(vertices.end(),
+                        {x, y, z, 0.18f, 0.25f, 0.35f, 1.0f});
+    };
+    for (int i = -5; i <= 5; ++i) {
+        addGridVertex(grid, static_cast<float>(i), -5.0f, -6.0f);
+        addGridVertex(grid, static_cast<float>(i), 5.0f, -6.0f);
+        addGridVertex(grid, -5.0f, static_cast<float>(i), -6.0f);
+        addGridVertex(grid, 5.0f, static_cast<float>(i), -6.0f);
+    }
+    glGenBuffers(1, &mPrismSceneGridBuffer);
+    glBindBuffer(GL_ARRAY_BUFFER, mPrismSceneGridBuffer);
+    glBufferData(GL_ARRAY_BUFFER, grid.size() * sizeof(GLfloat), grid.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    mPrismSceneProgram = program;
+    return true;
+}
+
+void GLESRenderEngine::destroyPrismScene() {
+    if (mPrismSceneGridBuffer != 0) {
+        glDeleteBuffers(1, &mPrismSceneGridBuffer);
+        mPrismSceneGridBuffer = 0;
+    }
+    if (mPrismSceneCubeBuffer != 0) {
+        glDeleteBuffers(1, &mPrismSceneCubeBuffer);
+        mPrismSceneCubeBuffer = 0;
+    }
+    if (mPrismSceneProgram != 0) {
+        glDeleteProgram(mPrismSceneProgram);
+        mPrismSceneProgram = 0;
+    }
+    if (mPrismSkyTexture != 0) {
+        glDeleteTextures(1, &mPrismSkyTexture);
+        mPrismSkyTexture = 0;
+    }
+    mPrismSkyLoadedPath.clear();
+    if (mPrismMenuTexture != 0) {
+        glDeleteTextures(1, &mPrismMenuTexture);
+        mPrismMenuTexture = 0;
+    }
+    mPrismMenuLoadedPath.clear();
+    for (auto& [path, envTexture] : mPrismEnvTextures) {
+        if (envTexture.texture != 0) {
+            glDeleteTextures(1, &envTexture.texture);
+            envTexture.texture = 0;
+        }
+    }
+    mPrismEnvTextures.clear();
+    if (mPrismEnvQuadBuffer != 0) {
+        glDeleteBuffers(1, &mPrismEnvQuadBuffer);
+        mPrismEnvQuadBuffer = 0;
+    }
+    if (mPrismEnvQuadProgram != 0) {
+        glDeleteProgram(mPrismEnvQuadProgram);
+        mPrismEnvQuadProgram = 0;
+    }
+    if (mPrismSkyProgram != 0) {
+        glDeleteProgram(mPrismSkyProgram);
+        mPrismSkyProgram = 0;
+    }
+    if (mPrismMenuProgram != 0) {
+        glDeleteProgram(mPrismMenuProgram);
+        mPrismMenuProgram = 0;
+    }
+    mPrismEnvLoadAttempted = false;
+}
+
+// Loads a PrismOS raw texture: b"PRW1" (RGB888) or b"PRW2" (RGBA8888), then u32 width,
+// u32 height (little endian), rows stored top-first. The channel count is taken from the magic.
+bool GLESRenderEngine::loadPrismRawTexture(const std::string& path, GLuint* texture,
+                                           uint32_t* outWidth, uint32_t* outHeight) {
+    FILE* file = fopen(path.c_str(), "rb");
+    if (file == nullptr) {
+        ALOGW("PrismOS env: texture not found (%s)", path.c_str());
+        return false;
+    }
+    char header[12];
+    const bool headerOk = fread(header, 1, sizeof(header), file) == sizeof(header);
+    uint32_t channels = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (headerOk) {
+        if (memcmp(header, "PRW1", 4) == 0) {
+            channels = 3;
+        } else if (memcmp(header, "PRW2", 4) == 0) {
+            channels = 4;
+        }
+        memcpy(&width, header + 4, sizeof(width));
+        memcpy(&height, header + 8, sizeof(height));
+    }
+    if (!headerOk || channels == 0 || width == 0 || height == 0 || width > 8192 ||
+        height > 8192) {
+        ALOGW("PrismOS env: texture malformed (%s)", path.c_str());
+        fclose(file);
+        return false;
+    }
+    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * channels);
+    const bool readOk = fread(pixels.data(), 1, pixels.size(), file) == pixels.size();
+    fclose(file);
+    if (!readOk) {
+        ALOGW("PrismOS env: texture truncated (%s)", path.c_str());
+        return false;
+    }
+
+    glGenTextures(1, texture);
+    glBindTexture(GL_TEXTURE_2D, *texture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    const GLenum format = channels == 3 ? GL_RGB : GL_RGBA;
+    glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE,
+                 pixels.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    if (outWidth != nullptr) {
+        *outWidth = width;
+    }
+    if (outHeight != nullptr) {
+        *outHeight = height;
+    }
+    ALOGI("PrismOS env: texture %ux%u loaded from %s", width, height, path.c_str());
+    return true;
+}
+
+// PrismOS test environment: compiles the sky, menu, and world-quad programs, and lazily loads
+// the textures by path. Paths and the quad list come from the scene settings (SurfaceFlinger
+// owns them: the packed scene file / vrender commands). Paths are re-checked whenever they
+// change, so scenes can be swapped at runtime.
+bool GLESRenderEngine::ensurePrismEnvironment(const PrismSceneSettings& scene) {
+    if (!scene.envEnabled) {
+        return false;
+    }
+    if (mPrismEnvQuadProgram == 0 || mPrismEnvQuadBuffer == 0) {
+        if (mPrismEnvLoadAttempted) {
+            return false;
+        }
+        mPrismEnvLoadAttempted = true;
+    }
+
+    // Fullscreen quad in NDC, shared by the sky and menu programs (positions only; the menu uv
+    // is derived in its vertex shader from the NDC position).
+    if (mPrismEnvQuadBuffer == 0) {
+        static constexpr GLfloat kQuad[] = {
+                -1.0f, -1.0f,
+                 1.0f, -1.0f,
+                -1.0f,  1.0f,
+                 1.0f,  1.0f,
+        };
+        glGenBuffers(1, &mPrismEnvQuadBuffer);
+        glBindBuffer(GL_ARRAY_BUFFER, mPrismEnvQuadBuffer);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(kQuad), kQuad, GL_STATIC_DRAW);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+
+    // Sky: per-pixel ray from the eye rotation and the eye frustum, sampled in the
+    // equirectangular panorama. World-locked, so it rotates with head tracking.
+    // Drawn with CLIENT-SIDE vertex arrays: the VBO-based draws proved unreliable on this
+    // driver (the client-pointer draws — the grid, the test quads — render fine), and the
+    // scene geometry is a handful of quads where the client path costs nothing.
+    static constexpr const char* kSkyVertexShader = R"(
+        attribute vec2 position;
+        uniform mat3 uSkyRotation;
+        uniform vec2 uTanHalfFov;
+        varying vec2 vSkyUv;
+        void main() {
+            gl_Position = vec4(position, 0.0, 1.0);
+            vec3 dirCam = normalize(vec3(position.x * uTanHalfFov.x,
+                                         position.y * uTanHalfFov.y, -1.0));
+            vec3 dir = uSkyRotation * dirCam;
+            vSkyUv = vec2(atan(dir.z, -dir.x) * 0.15915494 + 0.5,
+                          0.5 - asin(clamp(dir.y, -1.0, 1.0)) * 0.31830989);
+        }
+    )";
+    static constexpr const char* kSkyFragmentShader = R"(
+        precision mediump float;
+        uniform sampler2D uSky;
+        varying vec2 vSkyUv;
+        void main() {
+            gl_FragColor = texture2D(uSky, vSkyUv);
+        }
+    )";
+
+    const GLuint skyVertex = compilePrismShader(GL_VERTEX_SHADER, kSkyVertexShader);
+    const GLuint skyFragment = compilePrismShader(GL_FRAGMENT_SHADER, kSkyFragmentShader);
+    if (skyVertex != 0 && skyFragment != 0) {
+        const GLuint program = glCreateProgram();
+        glAttachShader(program, skyVertex);
+        glAttachShader(program, skyFragment);
+        glLinkProgram(program);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (linked == GL_TRUE) {
+            mPrismSkyProgram = program;
+            mPrismSkyPositionLocation = glGetAttribLocation(program, "position");
+            mPrismSkyRotationLocation = glGetUniformLocation(program, "uSkyRotation");
+            mPrismSkyTanHalfFovLocation = glGetUniformLocation(program, "uTanHalfFov");
+            mPrismSkySamplerLocation = glGetUniformLocation(program, "uSky");
+        } else {
+            ALOGE("PrismOS env: sky program link failed");
+            glDeleteProgram(program);
+        }
+    } else {
+        if (skyVertex != 0) glDeleteShader(skyVertex);
+        if (skyFragment != 0) glDeleteShader(skyFragment);
+    }
+
+    // Sky texture: loaded once per path; a vrender/scene path change reloads it.
+    if (!scene.skyPath.empty() && mPrismSkyLoadedPath != scene.skyPath &&
+        mPrismSkyAttemptedPath != scene.skyPath) {
+        mPrismSkyAttemptedPath = scene.skyPath;
+        GLuint texture = 0;
+        if (loadPrismRawTexture(scene.skyPath, &texture, nullptr, nullptr)) {
+            if (mPrismSkyTexture != 0) {
+                glDeleteTextures(1, &mPrismSkyTexture);
+            }
+            mPrismSkyTexture = texture;
+            mPrismSkyLoadedPath = scene.skyPath;
+            ALOGI("PrismOS env: sky switched to %s", scene.skyPath.c_str());
+        }
+    }
+
+    // Menu strip: RGBA overlay anchored to the top of each eye viewport. The uv is derived
+    // from the NDC position, so the shared position-only quad works for it too.
+    static constexpr const char* kMenuVertexShader = R"(
+        attribute vec2 position;
+        uniform vec2 uMenuScale;
+        uniform vec2 uMenuOffset;
+        varying vec2 vMenuUv;
+        void main() {
+            gl_Position = vec4(position.x, position.y * uMenuScale.y + uMenuOffset.y, 0.0, 1.0);
+            vMenuUv = vec2(position.x * 0.5 + 0.5, 0.5 - position.y * 0.5);
+        }
+    )";
+    static constexpr const char* kMenuFragmentShader = R"(
+        precision mediump float;
+        uniform sampler2D uMenu;
+        varying vec2 vMenuUv;
+        void main() {
+            gl_FragColor = texture2D(uMenu, vMenuUv);
+        }
+    )";
+
+    const GLuint menuVertex = compilePrismShader(GL_VERTEX_SHADER, kMenuVertexShader);
+    const GLuint menuFragment = compilePrismShader(GL_FRAGMENT_SHADER, kMenuFragmentShader);
+    if (menuVertex != 0 && menuFragment != 0) {
+        const GLuint program = glCreateProgram();
+        glAttachShader(program, menuVertex);
+        glAttachShader(program, menuFragment);
+        glLinkProgram(program);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (linked == GL_TRUE) {
+            mPrismMenuProgram = program;
+            mPrismMenuPositionLocation = glGetAttribLocation(program, "position");
+            mPrismMenuTextureLocation = glGetUniformLocation(program, "uMenu");
+            mPrismMenuScaleLocation = glGetUniformLocation(program, "uMenuScale");
+            mPrismMenuOffsetLocation = glGetUniformLocation(program, "uMenuOffset");
+        } else {
+            ALOGE("PrismOS env: menu program link failed");
+            glDeleteProgram(program);
+        }
+    } else {
+        if (menuVertex != 0) glDeleteShader(menuVertex);
+        if (menuFragment != 0) glDeleteShader(menuFragment);
+    }
+
+    // Menu texture: loaded once per path, same reload rule as the sky.
+    if (!scene.menuPath.empty() && mPrismMenuLoadedPath != scene.menuPath &&
+        mPrismMenuAttemptedPath != scene.menuPath) {
+        mPrismMenuAttemptedPath = scene.menuPath;
+        GLuint texture = 0;
+        uint32_t menuWidth = 0;
+        uint32_t menuHeight = 0;
+        if (loadPrismRawTexture(scene.menuPath, &texture, &menuWidth, &menuHeight)) {
+            if (mPrismMenuTexture != 0) {
+                glDeleteTextures(1, &mPrismMenuTexture);
+            }
+            mPrismMenuTexture = texture;
+            mPrismMenuLoadedPath = scene.menuPath;
+            mPrismMenuLoadedWidth = menuWidth;
+            mPrismMenuLoadedHeight = menuHeight;
+            ALOGI("PrismOS env: menu switched to %s", scene.menuPath.c_str());
+        }
+    }
+
+    // World-quad program + unit quad (positions + uv), drawn once per scene quad with a
+    // per-quad world matrix.
+    if (mPrismEnvQuadProgram == 0) {
+        static constexpr const char* kEnvQuadVertexShader = R"(
+            attribute vec3 position;
+            attribute vec2 uv;
+            uniform mat4 uMvp;
+            varying vec2 vQuadUv;
+            void main() {
+                gl_Position = uMvp * vec4(position, 1.0);
+                vQuadUv = uv;
+            }
+        )";
+        static constexpr const char* kEnvQuadFragmentShader = R"(
+            precision mediump float;
+            uniform sampler2D uQuadTexture;
+            varying vec2 vQuadUv;
+            void main() {
+                gl_FragColor = texture2D(uQuadTexture, vQuadUv);
+            }
+        )";
+
+        const GLuint quadVertex = compilePrismShader(GL_VERTEX_SHADER, kEnvQuadVertexShader);
+        const GLuint quadFragment =
+                compilePrismShader(GL_FRAGMENT_SHADER, kEnvQuadFragmentShader);
+        if (quadVertex != 0 && quadFragment != 0) {
+            const GLuint program = glCreateProgram();
+            glAttachShader(program, quadVertex);
+            glAttachShader(program, quadFragment);
+            glLinkProgram(program);
+            GLint linked = GL_FALSE;
+            glGetProgramiv(program, GL_LINK_STATUS, &linked);
+            if (linked == GL_TRUE) {
+                mPrismEnvQuadProgram = program;
+                mPrismEnvQuadPositionLocation = glGetAttribLocation(program, "position");
+                mPrismEnvQuadUvLocation = glGetAttribLocation(program, "uv");
+                mPrismEnvQuadMvpLocation = glGetUniformLocation(program, "uMvp");
+                mPrismEnvQuadTextureLocation = glGetUniformLocation(program, "uQuadTexture");
+            } else {
+                ALOGE("PrismOS env: quad program link failed");
+                glDeleteProgram(program);
+            }
+        } else {
+            if (quadVertex != 0) glDeleteShader(quadVertex);
+            if (quadFragment != 0) glDeleteShader(quadFragment);
+        }
+
+        if (mPrismWorldQuadBuffer == 0) {
+            // Unit quad in the quad's local plane, triangle strip; uv with v=0 at the top.
+            static constexpr GLfloat kWorldQuad[] = {
+                    -0.5f, -0.5f, 0.0f, 0.0f, 1.0f,
+                     0.5f, -0.5f, 0.0f, 1.0f, 1.0f,
+                    -0.5f,  0.5f, 0.0f, 0.0f, 0.0f,
+                     0.5f,  0.5f, 0.0f, 1.0f, 0.0f,
+            };
+            glGenBuffers(1, &mPrismWorldQuadBuffer);
+            glBindBuffer(GL_ARRAY_BUFFER, mPrismWorldQuadBuffer);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(kWorldQuad), kWorldQuad, GL_STATIC_DRAW);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+        }
+    }
+
+    const bool skyReady = mPrismSkyProgram != 0 && mPrismSkyTexture != 0;
+    ALOGI("PrismOS env: %s (sky=%d menu=%d)", skyReady ? "ready" : "unavailable",
+          mPrismSkyTexture != 0 ? 1 : 0, mPrismMenuTexture != 0 ? 1 : 0);
+    return skyReady;
+}
+
+// Draws the world-locked sky for the current eye viewport. Depth is left untouched so the
+// window pass above it behaves exactly like the plain-clear case.
+void GLESRenderEngine::drawPrismSkyBackdrop(const mat4& headView, float tanHalfFovY,
+                                            float aspect) {
+    if (!base::GetBoolProperty("debug.prismos.env.background", true)) {
+        return;
+    }
+    if (mPrismSkyProgram == 0 || mPrismSkyTexture == 0) {
+        return;
+    }
+
+    // View rotation (3-DOF) with an optional panorama yaw alignment. headView is column
+    // major; its upper-left 3x3 is the world->camera rotation. The shader maps a camera-space
+    // ray into the world, which needs the INVERSE (= transpose, rotations are orthogonal):
+    // world = yaw * Rview^T * dirCam. Using Rview directly mirrors the panorama and makes it
+    // spin counter to the head.
+    const float* view = headView.asArray();
+    const float yawDegrees =
+            prismFloatProperty("debug.prismos.env.sky_yaw", 0.0f);
+    const float yawRadians = yawDegrees * static_cast<float>(M_PI) / 180.0f;
+    const float c = std::cos(yawRadians);
+    const float s = std::sin(yawRadians);
+    // Rview^T in column-major: column j of the transpose is row j of the original.
+    const float t0 = view[0], t1 = view[4], t2 = view[8];
+    const float t3 = view[1], t4 = view[5], t5 = view[9];
+    const float t6 = view[2], t7 = view[6], t8 = view[10];
+    GLfloat rotation[9];
+    // M = yaw * Rview^T: column j of M is the yaw rotation applied to column j of Rview^T.
+    rotation[0] = c * t0 + s * t2;
+    rotation[1] = t1;
+    rotation[2] = -s * t0 + c * t2;
+    rotation[3] = c * t3 + s * t5;
+    rotation[4] = t4;
+    rotation[5] = -s * t3 + c * t5;
+    rotation[6] = c * t6 + s * t8;
+    rotation[7] = t7;
+    rotation[8] = -s * t6 + c * t8;
+
+    glUseProgram(mPrismSkyProgram);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_BLEND);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, mPrismSkyTexture);
+    glUniform1i(mPrismSkySamplerLocation, 0);
+    glUniformMatrix3fv(mPrismSkyRotationLocation, 1, GL_FALSE, rotation);
+    glUniform2f(mPrismSkyTanHalfFovLocation, tanHalfFovY * aspect, tanHalfFovY);
+    glBindBuffer(GL_ARRAY_BUFFER, mPrismEnvQuadBuffer);
+    glEnableVertexAttribArray(static_cast<GLuint>(mPrismSkyPositionLocation));
+    glVertexAttribPointer(static_cast<GLuint>(mPrismSkyPositionLocation), 2, GL_FLOAT,
+                          GL_FALSE, 8, nullptr);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray(static_cast<GLuint>(mPrismSkyPositionLocation));
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+}
+
+// Draws the world-space textured quads of the loaded scene. Depth-tested and depth-written,
+// so the quads sort against the spatial windows naturally; blending honors RGBA textures.
+void GLESRenderEngine::drawPrismEnvQuads(const PrismSceneSettings& scene, const mat4& eyeMvp) {
+    if (mPrismEnvQuadProgram == 0 || mPrismWorldQuadBuffer == 0) {
+        return;
+    }
+
+    glUseProgram(mPrismEnvQuadProgram);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glActiveTexture(GL_TEXTURE0);
+    // The unit quad comes from client-side memory (the proven draw path on this driver).
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glEnableVertexAttribArray(static_cast<GLuint>(mPrismEnvQuadPositionLocation));
+    glVertexAttribPointer(static_cast<GLuint>(mPrismEnvQuadPositionLocation), 3, GL_FLOAT,
+                          GL_FALSE, 20, kPrismWorldQuadVertices);
+    glEnableVertexAttribArray(static_cast<GLuint>(mPrismEnvQuadUvLocation));
+    glVertexAttribPointer(static_cast<GLuint>(mPrismEnvQuadUvLocation), 2, GL_FLOAT, GL_FALSE,
+                          20, reinterpret_cast<const void*>(12));
+    glUniform1i(mPrismEnvQuadTextureLocation, 0);
+
+    for (const auto& quad : scene.envQuads) {
+        if (!quad.visible || quad.texturePath.empty() || quad.height <= 0.0f) {
+            continue;
+        }
+        auto& envTexture = mPrismEnvTextures[quad.texturePath];
+        if (envTexture.texture == 0) {
+            GLuint texture = 0;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            if (!loadPrismRawTexture(quad.texturePath, &texture, &width, &height)) {
+                mPrismEnvTextures.erase(quad.texturePath);
+                continue;
+            }
+            envTexture.texture = texture;
+            envTexture.width = width;
+            envTexture.height = height;
+        }
+        glBindTexture(GL_TEXTURE_2D, envTexture.texture);
+        glUniform1i(mPrismEnvQuadTextureLocation, 0);
+
+        const float aspect = envTexture.height > 0
+                ? static_cast<float>(envTexture.width) / static_cast<float>(envTexture.height)
+                : 1.0f;
+        const mat4 world =
+                mat4::translate(vec4(quad.centerX, quad.centerY, -quad.distance, 1.0f)) *
+                mat4::rotate(quad.yawDegrees * static_cast<float>(M_PI) / 180.0f,
+                             vec3(0.0f, 1.0f, 0.0f)) *
+                mat4::scale(vec4(quad.height * aspect, quad.height, 1.0f, 1.0f));
+        glUniformMatrix4fv(mPrismEnvQuadMvpLocation, 1, GL_FALSE,
+                           (eyeMvp * world).asArray());
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDisable(GL_BLEND);
+}
+
+// Draws the RGBA menu strip (SteamVR-style bar) anchored to the top of the eye viewport.
+void GLESRenderEngine::drawPrismMenuOverlay(float eyeViewportHeight) {
+    if (mPrismMenuTexture == 0 || mPrismMenuProgram == 0) {
+        return;
+    }
+    if (!base::GetBoolProperty("debug.prismos.env.menu_overlay", true)) {
+        return;
+    }
+
+    // The bar height in NDC comes from the loaded strip's own aspect: the strip is authored at
+    // mPrismMenuLoadedWidth x mPrismMenuLoadedHeight for an eye viewport of that same width,
+    // anchored so its top sits at NDC +1.
+    if (mPrismMenuLoadedWidth == 0 || mPrismMenuLoadedHeight == 0) {
+        return;
+    }
+    const float barNdcHeight = 2.0f * static_cast<float>(mPrismMenuLoadedHeight) /
+            static_cast<float>(mPrismMenuLoadedWidth);
+    const float scaleY = barNdcHeight;
+    const float offsetY = 1.0f - barNdcHeight;
+
+    glUseProgram(mPrismMenuProgram);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, mPrismMenuTexture);
+    glUniform1i(mPrismMenuTextureLocation, 0);
+    glUniform2f(mPrismMenuScaleLocation, 1.0f, scaleY);
+    glUniform2f(mPrismMenuOffsetLocation, 0.0f, offsetY);
+    glEnableVertexAttribArray(static_cast<GLuint>(mPrismMenuPositionLocation));
+    glVertexAttribPointer(static_cast<GLuint>(mPrismMenuPositionLocation), 2, GL_FLOAT,
+                          GL_FALSE, 8, kPrismSkyQuadPositions);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray(static_cast<GLuint>(mPrismMenuPositionLocation));
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+}
+
+bool GLESRenderEngine::drawPrismScene(
+        const DisplaySettings& display, const PrismSceneSettings& scene,
+        const std::vector<PrismSpatialLayer>& spatialLayers,
+        std::vector<const LayerSettings*>* spatialWindowsDrawn) {
+    if (spatialWindowsDrawn != nullptr) {
+        spatialWindowsDrawn->clear();
+    }
+    if (!initializePrismScene()) {
+        return false;
+    }
+
+    const GLint targetWidth = display.physicalDisplay.getWidth();
+    const GLint targetHeight = display.physicalDisplay.getHeight();
+    const GLint leftHeight = targetHeight / 2;
+    const GLint rightHeight = targetHeight - leftHeight;
+    if (targetWidth <= 0 || targetHeight <= 1 || leftHeight <= 0 || rightHeight <= 0) {
+        return false;
+    }
+
+    static bool logged = false;
+    if (!logged) {
+        ALOGI("PRISM3D: scene enabled target %dx%d left viewport %dx%d right viewport %dx%d IPD %f",
+              targetWidth, targetHeight, targetWidth, leftHeight, targetWidth, rightHeight,
+              scene.ipd);
+        logged = true;
+    }
+
+    GLint oldViewport[4] = {};
+    GLint oldScissor[4] = {};
+    GLint oldProgram = 0;
+    GLint oldArrayBuffer = 0;
+    GLint oldDepthFunc = GL_LESS;
+    GLfloat oldLineWidth = 1.0f;
+    GLfloat oldClearColor[4] = {};
+    GLboolean oldDepthTest = GL_FALSE;
+    GLboolean oldBlend = GL_FALSE;
+    GLboolean oldScissorTest = GL_FALSE;
+    GLboolean oldDepthMask = GL_TRUE;
+    glGetIntegerv(GL_VIEWPORT, oldViewport);
+    glGetIntegerv(GL_SCISSOR_BOX, oldScissor);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &oldProgram);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &oldArrayBuffer);
+    glGetIntegerv(GL_DEPTH_FUNC, &oldDepthFunc);
+    glGetFloatv(GL_LINE_WIDTH, &oldLineWidth);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, oldClearColor);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &oldDepthMask);
+    oldDepthTest = glIsEnabled(GL_DEPTH_TEST);
+    oldBlend = glIsEnabled(GL_BLEND);
+    oldScissorTest = glIsEnabled(GL_SCISSOR_TEST);
+
+    const float fovRadians = scene.fovDegrees * 3.14159265358979323846f / 180.0f;
+    const float focalLength = 1.0f / std::tan(fovRadians * 0.5f);
+    const bool monoView = scene.monoView;
+    // PrismOS: the projection always uses the single-eye aspect (one eye viewport is
+    // targetWidth x leftHeight). The mono capture view reuses it so that the captured image
+    // shows the same frustum the wearer sees; the eye image is stretched over the full
+    // buffer height instead of shrinking the field of view and losing side windows.
+    const float aspect = static_cast<float>(targetWidth) / static_cast<float>(leftHeight);
+    const float zScale = (scene.farPlane + scene.nearPlane) / (scene.nearPlane - scene.farPlane);
+    const float zTranslate = (2.0f * scene.farPlane * scene.nearPlane) /
+            (scene.nearPlane - scene.farPlane);
+    const mat4 projection(vec4(focalLength / aspect, 0.0f, 0.0f, 0.0f),
+                          vec4(0.0f, focalLength, 0.0f, 0.0f),
+                          vec4(0.0f, 0.0f, zScale, -1.0f),
+                          vec4(0.0f, 0.0f, zTranslate, 0.0f));
+
+    // headTransform is head space to world space, so invert it exactly once for the view.
+    const mat4 headView = inverse(scene.headTransform);
+    const auto drawSpatialWindow = [&](const PrismSpatialLayer& spatial, const mat4& eyeMvp) {
+        const LayerSettings* layer = spatial.layer;
+        if (layer == nullptr || !prismLayerIsSpatialCandidate(*layer)) {
+            return false;
+        }
+        const sp<GraphicBuffer> windowBuffer = layer->source.buffer.buffer->getBuffer();
+        const uint32_t bufferWidth = windowBuffer->getWidth();
+        const uint32_t bufferHeight = windowBuffer->getHeight();
+        if (bufferWidth == 0 || bufferHeight == 0) {
+            return false;
+        }
+
+        validateInputBufferUsage(windowBuffer);
+        bindExternalTextureBuffer(layer->source.buffer.textureName, windowBuffer,
+                                  layer->source.buffer.fence);
+        Texture windowTexture(Texture::TEXTURE_EXTERNAL, layer->source.buffer.textureName);
+        windowTexture.setMatrix(layer->source.buffer.textureTransform.asArray());
+        windowTexture.setFiltering(layer->source.buffer.useTextureFiltering);
+        windowTexture.setDimensions(bufferWidth, bufferHeight);
+
+        Mesh windowMesh = Mesh::Builder()
+                                  .setPrimitive(Mesh::TRIANGLE_FAN)
+                                  .setVertices(4 /* count */, 2 /* size */)
+                                  .setTexCoords(2 /* size */)
+                                  .build();
+        Mesh::VertexArray<vec2> position(windowMesh.getPositionArray<vec2>());
+        position[0] = vec2(0.0f, 0.0f);
+        position[1] = vec2(0.0f, static_cast<float>(bufferHeight));
+        position[2] = vec2(static_cast<float>(bufferWidth), static_cast<float>(bufferHeight));
+        position[3] = vec2(static_cast<float>(bufferWidth), 0.0f);
+        Mesh::VertexArray<vec2> texCoords(windowMesh.getTexCoordArray<vec2>());
+        texCoords[0] = vec2(0.0f, 0.0f);
+        texCoords[1] = vec2(0.0f, 1.0f);
+        texCoords[2] = vec2(1.0f, 1.0f);
+        texCoords[3] = vec2(1.0f, 0.0f);
+
+        // PrismOS bring-up: the window bound to the camera. The window content is drawn
+        // fullscreen in NDC (the world transform bypassed) — isolates the texture path from
+        // the world transform math.
+        if (base::GetBoolProperty("debug.prismos.env.window_camera_test", false)) {
+            ALOGD("PrismOS camtest: drawing '%s' fullscreen NDC, buf=%ux%u",
+                  layer->name.c_str(), bufferWidth, bufferHeight);
+            position[0] = vec2(-1.0f, 1.0f);
+            position[1] = vec2(-1.0f, -1.0f);
+            position[2] = vec2(1.0f, -1.0f);
+            position[3] = vec2(1.0f, 1.0f);
+            texCoords[0] = vec2(0.0f, 0.0f);
+            texCoords[1] = vec2(0.0f, 1.0f);
+            texCoords[2] = vec2(1.0f, 1.0f);
+            texCoords[3] = vec2(1.0f, 0.0f);
+            mState.projectionMatrix = mat4();
+            glDisable(GL_DEPTH_TEST);
+            glDepthMask(GL_FALSE);
+            glDisable(GL_BLEND);
+            drawMesh(windowMesh);
+            glDepthMask(GL_TRUE);
+            glEnable(GL_DEPTH_TEST);
+            return true;
+        }
+
+        // PrismOS: the world frame (with the headset mount baked into the view rotation)
+        // mirrors screen-space X relative to the window's local frame, so the sampled
+        // content appears flipped left-to-right. Compensate in the UVs.
+        texCoords[0] = vec2(1.0f, 0.0f);
+        texCoords[1] = vec2(1.0f, 1.0f);
+        texCoords[2] = vec2(0.0f, 1.0f);
+        texCoords[3] = vec2(0.0f, 0.0f);
+
+        const float panelHeight = std::max(0.05f, spatial.settings.heightMeters);
+        const float scale = panelHeight / static_cast<float>(bufferHeight);
+        const float distance = std::max(0.25f, spatial.settings.distanceMeters);
+        const mat4 worldFromLocal =
+                mat4::translate(vec4(spatial.settings.centerXMeters, spatial.settings.centerYMeters,
+                                     -distance, 1.0f)) *
+                mat4::scale(vec4(scale, -scale, scale, 1.0f)) *
+                mat4::translate(vec4(-static_cast<float>(bufferWidth) * 0.5f,
+                                     -static_cast<float>(bufferHeight) * 0.5f, 0.0f, 1.0f));
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        mState.projectionMatrix = eyeMvp * worldFromLocal;
+        mState.cornerRadius = 0.0f;
+        mState.cropSize = half2(0.0f, 0.0f);
+        mState.drawShadows = false;
+        mState.colorMatrix = layer->colorTransform;
+        mState.displayColorMatrix = mat4();
+        mState.inputTransformMatrix = mat4();
+        mState.outputTransformMatrix = mat4();
+        mState.displayMaxLuminance = 0.0f;
+        mState.maxMasteringLuminance = 0.0f;
+        mState.maxContentLuminance = 0.0f;
+
+        setupLayerTexturing(windowTexture);
+        setupLayerBlending(layer->source.buffer.usePremultipliedAlpha,
+                           layer->source.buffer.isOpaque, false /* disableTexture */,
+                           half4(1.0f, 1.0f, 1.0f, layer->alpha), 0.0f);
+        if (layer->disableBlending) {
+            glDisable(GL_BLEND);
+        }
+        setSourceY410BT2020(layer->source.buffer.isY410BT2020);
+        setSourceDataSpace(layer->sourceDataspace);
+        // LEQUAL keeps coplanar quads composited by draw order instead of rejecting the second
+        // one: an activity window and its dialog (or any window override sharing a slot) sit on
+        // the same plane, and the later, higher-stacked draw must blend over the earlier one.
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_TRUE);
+        drawMesh(windowMesh);
+        // PrismOS bring-up diagnostics: the window draw state, once per second.
+        {
+            static int windowDiagCount = 0;
+            if (windowDiagCount++ % 60 == 0) {
+                const GLenum drawError = glGetError();
+                const mat4& mvp = mState.projectionMatrix;
+                ALOGD("PrismOS window: '%s' err=0x%x buf=%ux%u alpha=%.2f opaque=%d "
+                      "mvpT=(%.2f, %.2f, %.2f)",
+                      layer->name.c_str(), drawError, bufferWidth, bufferHeight,
+                      static_cast<float>(layer->alpha), layer->source.buffer.isOpaque ? 1 : 0,
+                      mvp[0][3], mvp[1][3], mvp[2][3]);
+            }
+        }
+
+        setSourceY410BT2020(false);
+        setSourceDataSpace(Dataspace::UNKNOWN);
+        disableTexturing();
+        disableBlending();
+        mState.isPremultipliedAlpha = false;
+        mState.isOpaque = true;
+        mState.color = half4(0.0f, 0.0f, 0.0f, 0.0f);
+        mState.colorMatrix = mat4();
+        mState.displayColorMatrix = mat4();
+        mState.projectionMatrix = eyeMvp;
+        return true;
+    };
+
+    const auto drawEye = [&](GLint viewportY, GLint viewportHeight, float eyeOffset) {
+        glViewport(0, viewportY, targetWidth, viewportHeight);
+        glScissor(0, viewportY, targetWidth, viewportHeight);
+        glEnable(GL_SCISSOR_TEST);
+        glClearColor(0.008f, 0.012f, 0.025f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        // PrismOS: compile the environment programs and load the textures once, before the
+        // sky/menu/quad draws that depend on them.
+        ensurePrismEnvironment(scene);
+        // PrismOS bring-up: unmistakable test pattern. Left eye = red, right eye = blue; two
+        // quads drawn per eye: one with the scene program, one with a freshly compiled minimal
+        // program. Logs the GL error and program validation to isolate invisible draws.
+        if (base::GetBoolProperty("debug.prismos.env.testpattern", false)) {
+            static const GLfloat kTestPositions[] = {
+                    -0.5f, -0.5f, 0.0f,
+                     0.5f, -0.5f, 0.0f,
+                    -0.5f,  0.5f, 0.0f,
+                     0.5f,  0.5f, 0.0f,
+            };
+            static const GLfloat kTestColors[] = {
+                    0.0f, 1.0f, 0.0f, 1.0f,
+                    0.0f, 1.0f, 0.0f, 1.0f,
+                    0.0f, 1.0f, 0.0f, 1.0f,
+                    0.0f, 1.0f, 0.0f, 1.0f,
+            };
+            const bool leftEye = viewportY == 0;
+            glClearColor(leftEye ? 1.0f : 0.0f, 0.0f, leftEye ? 0.0f : 1.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            glDisable(GL_DEPTH_TEST);
+            glDepthMask(GL_FALSE);
+            glDisable(GL_BLEND);
+
+            glUseProgram(mPrismSceneProgram);
+            glUniformMatrix4fv(mPrismSceneMvpLocation, 1, GL_FALSE, mat4().asArray());
+            glEnableVertexAttribArray(static_cast<GLuint>(mPrismScenePositionLocation));
+            glEnableVertexAttribArray(static_cast<GLuint>(mPrismSceneColorLocation));
+            glVertexAttribPointer(static_cast<GLuint>(mPrismScenePositionLocation), 3, GL_FLOAT,
+                                  GL_FALSE, 0, kTestPositions);
+            glVertexAttribPointer(static_cast<GLuint>(mPrismSceneColorLocation), 4, GL_FLOAT,
+                                  GL_FALSE, 0, kTestColors);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            const GLenum sceneError = glGetError();
+
+            // Fresh minimal program: same quad, offset to the left, cyan.
+            static const GLuint freshProgram = [] {
+                const char* vertex = "attribute vec2 p; void main() { gl_Position = "
+                                     "vec4(p, 0.0, 1.0); }";
+                const char* fragment = "precision mediump float; void main() { gl_FragColor = "
+                                       "vec4(0.0, 1.0, 1.0, 1.0); }";
+                const GLuint v = compilePrismShader(GL_VERTEX_SHADER, vertex);
+                const GLuint f = compilePrismShader(GL_FRAGMENT_SHADER, fragment);
+                const GLuint program = glCreateProgram();
+                glAttachShader(program, v);
+                glAttachShader(program, f);
+                glLinkProgram(program);
+                glDeleteShader(v);
+                glDeleteShader(f);
+                return program;
+            }();
+            glUseProgram(freshProgram);
+            static const GLfloat kFreshPositions[] = {
+                    -0.95f, -0.2f, 0.0f,
+                    -0.45f, -0.2f, 0.0f,
+                    -0.95f,  0.2f, 0.0f,
+                    -0.45f,  0.2f, 0.0f,
+            };
+            const GLint freshLocation = glGetAttribLocation(freshProgram, "p");
+            glEnableVertexAttribArray(static_cast<GLuint>(freshLocation));
+            glVertexAttribPointer(static_cast<GLuint>(freshLocation), 2, GL_FLOAT, GL_FALSE, 0,
+                                  kFreshPositions);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            const GLenum freshError = glGetError();
+            glDisableVertexAttribArray(static_cast<GLuint>(freshLocation));
+
+            GLint validateStatus = 0;
+            glValidateProgram(mPrismSceneProgram);
+            glGetProgramiv(mPrismSceneProgram, GL_VALIDATE_STATUS, &validateStatus);
+            char validateLog[256] = {};
+            glGetProgramInfoLog(mPrismSceneProgram, sizeof(validateLog), nullptr, validateLog);
+            ALOGD("PrismOS test: eye=%s sceneErr=0x%x freshErr=0x%x sceneProg=%u valid=%d "
+                  "log='%s'",
+                  leftEye ? "L" : "R", sceneError, freshError, mPrismSceneProgram,
+                  validateStatus, validateLog);
+            glDepthMask(GL_TRUE);
+            glEnable(GL_DEPTH_TEST);
+            return;
+        }
+        // PrismOS test environment: world-locked SteamVR-style sky, the reference grid, scene
+        // quads, and the menu strip on top of everything (screen-space overlay).
+        const mat4 view = mat4::translate(vec4(eyeOffset, 0.0f, 0.0f, 1.0f)) * headView;
+        const mat4 eyeMvp = projection * view;
+        drawPrismSkyBackdrop(headView, 1.0f / focalLength,
+                             static_cast<float>(targetWidth) / static_cast<float>(viewportHeight));
+        // The reference grid: always drawn (it is the "scene reaches the panel" marker and a
+        // depth cue); sits at z=-6, behind every window and quad.
+        glUseProgram(mPrismSceneProgram);
+        glUniformMatrix4fv(mPrismSceneMvpLocation, 1, GL_FALSE, eyeMvp.asArray());
+        glEnableVertexAttribArray(static_cast<GLuint>(mPrismScenePositionLocation));
+        glEnableVertexAttribArray(static_cast<GLuint>(mPrismSceneColorLocation));
+        // Client-side arrays (the grid data is re-sent per draw; it is tiny and this path
+        // proved reliable on this driver where VBO-based draws silently do not render).
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glVertexAttribPointer(static_cast<GLuint>(mPrismScenePositionLocation), 3, GL_FLOAT,
+                              GL_FALSE, 28, kPrismGridData.data());
+        glVertexAttribPointer(static_cast<GLuint>(mPrismSceneColorLocation), 4, GL_FLOAT,
+                              GL_FALSE, 28, kPrismGridData.data() + 3);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(kPrismGridVertexCount));
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        drawPrismEnvQuads(scene, eyeMvp);
+        glUseProgram(mPrismSceneProgram);
+        glEnableVertexAttribArray(static_cast<GLuint>(mPrismScenePositionLocation));
+        glEnableVertexAttribArray(static_cast<GLuint>(mPrismSceneColorLocation));
+        glDisable(GL_BLEND);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_TRUE);
+        glUniformMatrix4fv(mPrismSceneMvpLocation, 1, GL_FALSE, eyeMvp.asArray());
+        // Painter order: windows resolved from the layer stack arrive top-first, so drawing
+        // them back-to-front with LEQUAL gives stacked coplanar windows correct blending while
+        // the depth test still sorts windows that sit at different world depths.
+        for (auto spatial = spatialLayers.rbegin(); spatial != spatialLayers.rend(); ++spatial) {
+            if (drawSpatialWindow(*spatial, eyeMvp) && spatialWindowsDrawn != nullptr) {
+                spatialWindowsDrawn->push_back(spatial->layer);
+            }
+        }
+        drawPrismMenuOverlay(static_cast<float>(viewportHeight));
+    };
+
+    if (monoView) {
+        // Capture path: a single centered view over the whole buffer — what the wearer
+        // sees, usable directly for screenshots and screen recording.
+        drawEye(0, targetHeight, 0.0f);
+    } else {
+        drawEye(0, leftHeight, -scene.ipd * 0.5f);
+        drawEye(leftHeight, rightHeight, scene.ipd * 0.5f);
+    }
+    for (const auto& spatial : spatialLayers) {
+        const sp<GraphicBuffer> buffer = spatial.layer->source.buffer.buffer->getBuffer();
+        if (buffer->getUsage() & GRALLOC_USAGE_PROTECTED) {
+            // Same rule as the flat path: do not keep protected EGLImages cached.
+            unmapExternalTextureBuffer(buffer);
+        }
+    }
+
+    glDisableVertexAttribArray(static_cast<GLuint>(mPrismScenePositionLocation));
+    glDisableVertexAttribArray(static_cast<GLuint>(mPrismSceneColorLocation));
+    glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(oldArrayBuffer));
+    glUseProgram(static_cast<GLuint>(oldProgram));
+    glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
+    glScissor(oldScissor[0], oldScissor[1], oldScissor[2], oldScissor[3]);
+    if (oldScissorTest) {
+        glEnable(GL_SCISSOR_TEST);
+    } else {
+        glDisable(GL_SCISSOR_TEST);
+    }
+    if (oldDepthTest) {
+        glEnable(GL_DEPTH_TEST);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+    }
+    glDepthFunc(static_cast<GLenum>(oldDepthFunc));
+    glDepthMask(oldDepthMask);
+    glLineWidth(oldLineWidth);
+    glClearColor(oldClearColor[0], oldClearColor[1], oldClearColor[2], oldClearColor[3]);
+    if (oldBlend) {
+        glEnable(GL_BLEND);
+    } else {
+        glDisable(GL_BLEND);
+    }
+    return true;
+}
+
 void GLESRenderEngine::drawLayersInternal(
         const std::shared_ptr<std::promise<RenderEngineResult>>&& resultPromise,
         const DisplaySettings& display, const std::vector<LayerSettings>& layers,
         const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
         base::unique_fd&& bufferFence) {
+    drawLayersInternalImpl(std::move(resultPromise), display, layers, buffer, useFramebufferCache,
+                           std::move(bufferFence), nullptr);
+}
+
+void GLESRenderEngine::drawLayersInternalWithPrismScene(
+        const std::shared_ptr<std::promise<RenderEngineResult>>&& resultPromise,
+        const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+        const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
+        base::unique_fd&& bufferFence, const PrismSceneSettings& scene) {
+    drawLayersInternalImpl(std::move(resultPromise), display, layers, buffer, useFramebufferCache,
+                           std::move(bufferFence), &scene);
+}
+
+void GLESRenderEngine::drawLayersInternalImpl(
+        const std::shared_ptr<std::promise<RenderEngineResult>>&& resultPromise,
+        const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+        const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
+        base::unique_fd&& bufferFence, const PrismSceneSettings* scene) {
     ATRACE_CALL();
-    if (layers.empty()) {
+    // PrismOS: capture probe. Screenshot draws arrive with the fill layer only (≤1 layer);
+    // rate-limited so ordinary frames stay silent. Remove once capture is fixed.
+    if (layers.size() <= 1) {
+        static std::chrono::steady_clock::time_point sLastProbe;
+        const auto nowProbe = std::chrono::steady_clock::now();
+        if (nowProbe - sLastProbe > std::chrono::seconds(1)) {
+            sLastProbe = nowProbe;
+            ALOGD("PrismOS drawLayers probe: layers=%zu display=[%d %d %d %d] scene=%s",
+                  layers.size(), display.physicalDisplay.left, display.physicalDisplay.top,
+                  display.physicalDisplay.right, display.physicalDisplay.bottom,
+                  scene != nullptr ? "yes" : "no");
+        }
+    }
+    const bool sceneEnabled = scene != nullptr && scene->enabled;
+    const std::vector<PrismSpatialLayer> spatialLayers =
+            sceneEnabled ? resolvePrismSpatialLayers(layers, *scene)
+                         : std::vector<PrismSpatialLayer>();
+    if (scene != nullptr && (!sceneEnabled || !scene->spatialWindowEnabled)) {
+        // No GL resources or layer pointers are stored here, but clear placement state promptly
+        // when the feature turns off. Capture-side draws pass scene == nullptr (screenshots,
+        // the region sampler) and must not wipe placement state or membership logging.
+        mPrismSpatialWindowStates.clear();
+    }
+    std::vector<const LayerSettings*> spatialWindowsDrawn;
+    std::vector<std::string> spatialWindowsDrawnKeys;
+    if (sceneEnabled && scene->spatialWindowEnabled) {
+        std::string selected;
+        for (const auto& spatial : spatialLayers) {
+            if (!selected.empty()) selected += ", ";
+            selected += spatial.settings.id;
+        }
+        if (selected != mPrismSpatialWindowLoggedLayers) {
+            if (spatialLayers.empty()) {
+                ALOGI("PrismOS spatial windows: none available this frame (%zu layers on screen)",
+                      layers.size());
+            } else {
+                ALOGI("PrismOS spatial windows active: %s", selected.c_str());
+            }
+            mPrismSpatialWindowLoggedLayers = selected;
+        }
+    } else if (scene != nullptr && !mPrismSpatialWindowLoggedLayers.empty()) {
+        ALOGI("PrismOS spatial windows disabled");
+        mPrismSpatialWindowLoggedLayers.clear();
+    }
+    if (layers.empty() && !sceneEnabled) {
         ALOGV("Drawing empty layer stack");
         resultPromise->set_value({NO_ERROR, base::unique_fd()});
         return;
@@ -1096,7 +2348,13 @@ void GLESRenderEngine::drawLayersInternal(
         base::unique_fd bufferFenceDup(dup(bufferFence.get()));
         if (bufferFenceDup < 0 || !waitFence(std::move(bufferFenceDup))) {
             ATRACE_NAME("Waiting before draw");
-            sync_wait(bufferFence.get(), -1);
+            // PrismOS: a bounded wait. A dead producer (a force-stopped app mid-frame) would
+            // otherwise hang the RenderEngine thread forever, freezing the whole display on
+            // the last frame. A timed-out fence renders the buffer as-is for one frame.
+            const int waitResult = sync_wait(bufferFence.get(), 250);
+            if (waitResult != 0) {
+                ALOGW("PrismOS: buffer fence wait timed out (%d), drawing anyway", waitResult);
+            }
         }
     }
 
@@ -1159,6 +2417,34 @@ void GLESRenderEngine::drawLayersInternal(
     setDisplayMaxLuminance(display.maxLuminance);
     setDisplayColorTransform(display.colorTransform);
 
+    if (sceneEnabled) {
+        auto* framebuffer = static_cast<GLFramebuffer*>(getFramebufferForDrawing());
+        const uint32_t width = static_cast<uint32_t>(display.physicalDisplay.getWidth());
+        const uint32_t height = static_cast<uint32_t>(display.physicalDisplay.getHeight());
+        bool sceneRendered = false;
+        if (width > 0 && height > 0 && framebuffer->prepareDepthBuffer(width, height)) {
+            sceneRendered = drawPrismScene(display, *scene, spatialLayers, &spatialWindowsDrawn);
+            framebuffer->detachDepthBuffer();
+        }
+        if (!sceneRendered) {
+            spatialWindowsDrawn.clear();
+            ALOGW("PrismOS 3D scene failed; continuing with Android layer composition");
+        }
+        // The stereo packing duplicates every layer into an eye copy sharing the window's name
+        // and id, so flat-copy suppression is keyed by window identity: pointer identity would
+        // leak the right-eye copy of every spatial window over the scene.
+        spatialWindowsDrawnKeys.reserve(spatialWindowsDrawn.size());
+        for (const LayerSettings* drawn : spatialWindowsDrawn) {
+            spatialWindowsDrawnKeys.push_back(
+                    prism::spatialStateKey(drawn->prismSpatialWindowId, drawn->name));
+        }
+        // The scene pass changes the GL viewport, ProgramCache state, and display transform.
+        // Restore the ordinary Android path before entering the existing draw loop.
+        setViewportAndProjection(display.physicalDisplay, display.clip);
+        setDisplayColorTransform(display.colorTransform);
+        setDisplayMaxLuminance(display.maxLuminance);
+    }
+
     const mat4 projectionMatrix =
             ui::Transform(display.orientation).asMatrix4() * mState.projectionMatrix;
 
@@ -1168,7 +2454,39 @@ void GLESRenderEngine::drawLayersInternal(
                         .setTexCoords(2 /* size */)
                         .setCropCoords(2 /* size */)
                         .build();
+    // Suppress only a layer whose window identity was actually drawn into the scene and that
+    // opted into suppression. The key match covers both SBS eye copies of the same window while
+    // leaving a different window with a similar name on the flat path.
+    const auto shouldSuppressFlatCopy = [&](const LayerSettings& layer) {
+        if (spatialWindowsDrawnKeys.empty()) {
+            return false;
+        }
+        const std::string layerKey =
+                prism::spatialStateKey(layer.prismSpatialWindowId, layer.name);
+        if (std::find(spatialWindowsDrawnKeys.begin(), spatialWindowsDrawnKeys.end(), layerKey) ==
+            spatialWindowsDrawnKeys.end()) {
+            return false;
+        }
+        const auto spatial = std::find_if(spatialLayers.begin(), spatialLayers.end(),
+                                          [&layerKey](const PrismSpatialLayer& candidate) {
+                                              return prism::spatialStateKey(
+                                                             candidate.layer->prismSpatialWindowId,
+                                                             candidate.layer->name) == layerKey;
+                                          });
+        return spatial != spatialLayers.end() && spatial->settings.suppressFlatCopy;
+    };
+    const bool prismFlatLayersEnabled =
+            base::GetBoolProperty("debug.prismos.flat_layers", true);
     for (const auto& layer : layers) {
+        // PrismOS scene-only mode: the spatial scene (sky, grid, quads, windows) replaces the
+        // flat Android UI entirely. The flat draws of heavy UI content through the stereo
+        // packing were hanging the GPU driver, so they are skipped wholesale when disabled.
+        if (sceneEnabled && !prismFlatLayersEnabled) {
+            continue;
+        }
+        if (shouldSuppressFlatCopy(layer)) {
+            continue;
+        }
         if (blurLayers.size() > 0 && blurLayers.front() == layer) {
             blurLayers.pop_front();
 
@@ -1219,6 +2537,27 @@ void GLESRenderEngine::drawLayersInternal(
         mState.maxMasteringLuminance = maxLuminance;
         mState.maxContentLuminance = maxLuminance;
         mState.projectionMatrix = projectionMatrix * layer.geometry.positionTransform;
+
+        // PrismOS bring-up diagnostics: once per second, the first flat layers with their
+        // composed clip-space translation — reveals layers that land off-screen.
+        {
+            static uint32_t flatDiagFrame = 0;
+            static int flatDiagCount = 0;
+            if (flatDiagFrame != mPrismSceneFrame || flatDiagCount < 4) {
+                if (flatDiagFrame != mPrismSceneFrame) {
+                    flatDiagFrame = mPrismSceneFrame;
+                    flatDiagCount = 0;
+                }
+                if (flatDiagCount < 4) {
+                    const float* m = mState.projectionMatrix.asArray();
+                    const float ndcX = m[12] / m[15];
+                    const float ndcY = m[13] / m[15];
+                    ALOGD("PrismOS flat: '%s' skip=%d ndc=(%.2f, %.2f, w=%.2f)", layer.name.c_str(),
+                          layer.skipContentDraw ? 1 : 0, ndcX, ndcY, m[15]);
+                    flatDiagCount++;
+                }
+            }
+        }
 
         const FloatRect bounds = layer.geometry.boundaries;
         Mesh::VertexArray<vec2> position(mesh.getPositionArray<vec2>());
@@ -1295,6 +2634,22 @@ void GLESRenderEngine::drawLayersInternal(
             disableBlending();
             setSourceY410BT2020(false);
             disableTexturing();
+        }
+    }
+
+    // PrismOS: gated dump of the composed flat frame (exactly what the HWC would
+    // present) for offline inspection. Rate-limited to one frame per second while
+    // the gate is on; pull with `adb pull /data/local/tmp/prism_flat.ppm`.
+    if (base::GetBoolProperty("debug.prismos.env.frame_dump", false)) {
+        static std::chrono::steady_clock::time_point sLastDump;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - sLastDump > std::chrono::seconds(1)) {
+            sLastDump = now;
+            GLint vp[4] = {0, 0, 0, 0};
+            glGetIntegerv(GL_VIEWPORT, vp);
+            (void)vp;
+            writePPM("/data/local/tmp/prism_flat", mVpWidth, mVpHeight);
+            ALOGD("PRISM-DUMP: flat frame dumped %ux%u", mVpWidth, mVpHeight);
         }
     }
 
@@ -1425,6 +2780,11 @@ void GLESRenderEngine::drawMesh(const Mesh& mesh) {
                               mesh.getByteStride(), mesh.getTexCoords());
     }
 
+    // PrismOS: the position array must be enabled explicitly. The upstream GLES path never
+    // enables it (dead code once Skia became the default backend), so with the GLES backend
+    // selected via debug.renderengine.backend every drawMesh rasterizes a degenerate triangle
+    // — silently black captures and invisible client-composited windows.
+    glEnableVertexAttribArray(Program::position);
     glVertexAttribPointer(Program::position, mesh.getVertexSize(), GL_FLOAT, GL_FALSE,
                           mesh.getByteStride(), mesh.getPositions());
 

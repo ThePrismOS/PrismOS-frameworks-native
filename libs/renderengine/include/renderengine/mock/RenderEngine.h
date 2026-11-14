@@ -52,6 +52,11 @@ public:
                                                  const std::vector<LayerSettings>&,
                                                  const std::shared_ptr<ExternalTexture>&,
                                                  const bool, base::unique_fd&&));
+    MOCK_METHOD6(drawLayersWithPrismScene,
+                 std::future<RenderEngineResult>(
+                         const DisplaySettings&, const std::vector<LayerSettings>&,
+                         const std::shared_ptr<ExternalTexture>&, const bool, base::unique_fd&&,
+                         const PrismSceneSettings&));
     MOCK_METHOD6(drawLayersInternal,
                  void(const std::shared_ptr<std::promise<RenderEngineResult>>&&,
                       const DisplaySettings&, const std::vector<LayerSettings>&,

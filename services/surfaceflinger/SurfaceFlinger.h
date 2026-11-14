@@ -38,6 +38,7 @@
 #include <layerproto/LayerProtoHeader.h>
 #include <math/mat4.h>
 #include <renderengine/LayerSettings.h>
+#include <renderengine/PrismScene.h>
 #include <serviceutils/PriorityDumper.h>
 #include <system/graphics.h>
 #include <ui/FenceTime.h>
@@ -107,6 +108,8 @@ class HWComposer;
 class IGraphicBufferProducer;
 class Layer;
 class MessageBase;
+class PrismHandTracker;
+class PrismHeadTracker;
 class RefreshRateOverlay;
 class RegionSamplingThread;
 class RenderArea;
@@ -1125,6 +1128,34 @@ private:
 
     status_t doDump(int fd, const DumpArgs& args, bool asProto);
 
+    // PrismOS packed scene, controlled via `dumpsys SurfaceFlinger vrender ...` and scene
+    // files. Applied to PrismSceneSettings every frame; guarded by its own mutex (composite
+    // reads it without holding mStateLock).
+    std::mutex mPrismSceneMutex;
+    struct PrismSceneDescription {
+        bool loaded = false;
+        std::string skyPath;
+        std::string menuPath;
+        struct Quad {
+            std::string name;
+            std::string texturePath;
+            float centerX = 0.0f;
+            float centerY = 0.0f;
+            float distance = 2.0f;
+            float height = 0.5f;
+            float yawDegrees = 0.0f;
+            bool visible = true;
+        };
+        std::vector<Quad> quads;
+    };
+    PrismSceneDescription mPrismSceneDescription;
+    // PrismOS: the PrismSceneSettings composite() built for the current frame. Captures
+    // (screencap, scrcpy) render outside the composite pipeline and reuse it so that they
+    // show the same scene the panel shows. Guarded by mPrismSceneMutex.
+    renderengine::PrismSceneSettings mLastPrismScene;
+    void vrenderCommand(const DumpArgs& args, std::string& result);
+    bool loadPrismSceneFileLocked(const std::string& path, std::string& result);
+
     status_t dumpCritical(int fd, const DumpArgs&, bool asProto);
 
     status_t dumpAll(int fd, const DumpArgs& args, bool asProto) override {
@@ -1168,6 +1199,8 @@ private:
 
     sp<StartPropertySetThread> mStartPropertySetThread;
     surfaceflinger::Factory& mFactory;
+    std::unique_ptr<PrismHeadTracker> mPrismHeadTracker;
+    std::unique_ptr<PrismHandTracker> mPrismHandTracker;
     pid_t mPid;
     std::future<void> mRenderEnginePrimeCacheFuture;
 

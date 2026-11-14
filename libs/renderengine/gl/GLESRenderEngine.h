@@ -18,11 +18,14 @@
 #define SF_GLESRENDERENGINE_H_
 
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -107,6 +110,11 @@ protected:
                             const std::vector<LayerSettings>& layers,
                             const std::shared_ptr<ExternalTexture>& buffer,
                             const bool useFramebufferCache, base::unique_fd&& bufferFence) override;
+    void drawLayersInternalWithPrismScene(
+            const std::shared_ptr<std::promise<RenderEngineResult>>&& resultPromise,
+            const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+            const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
+            base::unique_fd&& bufferFence, const PrismSceneSettings& scene) override;
 
 private:
     friend class BindNativeBufferAsFramebuffer;
@@ -143,6 +151,56 @@ private:
     void bindExternalTextureImage(uint32_t texName, const Image& image);
     void bindExternalTextureBuffer(uint32_t texName, const sp<GraphicBuffer>& buffer,
                                    const sp<Fence>& fence) EXCLUDES(mRenderingMutex);
+    void drawLayersInternalImpl(
+            const std::shared_ptr<std::promise<RenderEngineResult>>&& resultPromise,
+            const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+            const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
+            base::unique_fd&& bufferFence, const PrismSceneSettings* scene);
+    struct PrismSpatialLayer {
+        const LayerSettings* layer = nullptr;
+        PrismSpatialWindowSettings settings;
+    };
+
+    struct PrismSpatialWindowState {
+        PrismSpatialWindowSettings settings;
+        uint64_t lastSeenFrame = 0;
+        // Frame the window was last resolved into the draw list. The stereo packing emits two
+        // eye copies per frame; deduping on the map insert alone would resolve a window only
+        // on the frame its placement state was created, hiding it from every later frame.
+        uint64_t lastResolvedFrame = 0;
+        uint32_t automaticLayoutSlot = 0;
+    };
+
+    // Resolves the current frame's tagged application layers without retaining pointers or
+    // GraphicBuffers beyond this composition. Placement state is keyed by window identity and
+    // retained across surface recreation, so an app that was switched away and back returns to
+    // the same world transform instead of reshuffling the layout.
+    std::vector<PrismSpatialLayer> resolvePrismSpatialLayers(
+            const std::vector<LayerSettings>& layers, const PrismSceneSettings& scene);
+    // Returns the lowest automatic layout slot not claimed by a window with retained placement.
+    uint32_t nextFreePrismLayoutSlot() const;
+    // Draws every resolved Prism window for both eyes in painter order. Layers recorded in
+    // `spatialWindowsDrawn` identify the windows whose flat Android copies may be suppressed.
+    bool drawPrismScene(const DisplaySettings& display, const PrismSceneSettings& scene,
+                        const std::vector<PrismSpatialLayer>& spatialLayers,
+                        std::vector<const LayerSettings*>* spatialWindowsDrawn);
+    bool initializePrismScene();
+    void destroyPrismScene();
+    // PrismOS test environment: compiles the sky/menu/quad programs and lazily loads their
+    // textures; returns false while the environment is switched off or nothing is loadable.
+    bool ensurePrismEnvironment(const PrismSceneSettings& scene);
+    // Loads a PrismOS raw texture (PRW1 = RGB888 / PRW2 = RGBA8888) into a GL texture; the
+    // channel count is taken from the file magic.
+    bool loadPrismRawTexture(const std::string& path, GLuint* texture, uint32_t* outWidth,
+                             uint32_t* outHeight);
+    // Draws the world-locked equirect sky for the current eye viewport. headView carries the
+    // view rotation; tanHalfFovY and aspect match the scene projection. Call right after the
+    // eye clear; restores the depth state it changes.
+    void drawPrismSkyBackdrop(const mat4& headView, float tanHalfFovY, float aspect);
+    // Draws the world-space textured quads of the loaded scene (depth-sorted with windows).
+    void drawPrismEnvQuads(const PrismSceneSettings& scene, const mat4& eyeMvp);
+    // Draws the RGBA menu strip anchored to the top of the current eye viewport.
+    void drawPrismMenuOverlay(float eyeViewportHeight);
     void cleanFramebufferCache() EXCLUDES(mFramebufferImageCacheMutex) override;
 
     // A data space is considered HDR data space if it has BT2020 color space
@@ -255,6 +313,58 @@ private:
     std::mutex mRenderingMutex;
 
     std::unique_ptr<Framebuffer> mDrawingBuffer;
+    GLuint mPrismSceneProgram = 0;
+    GLuint mPrismSceneGridBuffer = 0;
+    GLuint mPrismSceneCubeBuffer = 0;
+    GLint mPrismSceneMvpLocation = -1;
+    GLint mPrismScenePositionLocation = -1;
+    GLint mPrismSceneColorLocation = -1;
+    // PrismOS test environment backdrop: a ray-sampled equirectangular sky (world-locked, it
+    // rotates with head tracking like SteamVR backgrounds) plus an optional RGBA menu-strip
+    // overlay anchored to the top of each eye viewport. Textures are raw files (PRW1 = RGB888,
+    // PRW2 = RGBA8888, each b"magic" + u32 width + u32 height + rows top-first); the paths come
+    // from PrismSceneSettings (owned by SurfaceFlinger: scene file / vrender commands).
+    GLuint mPrismSkyTexture = 0;
+    std::string mPrismSkyLoadedPath;
+    std::string mPrismSkyAttemptedPath;
+    GLuint mPrismSkyProgram = 0;
+    GLuint mPrismMenuTexture = 0;
+    std::string mPrismMenuLoadedPath;
+    std::string mPrismMenuAttemptedPath;
+    uint32_t mPrismMenuLoadedWidth = 0;
+    uint32_t mPrismMenuLoadedHeight = 0;
+    GLuint mPrismMenuProgram = 0;
+    GLuint mPrismEnvQuadBuffer = 0;
+    GLuint mPrismWorldQuadBuffer = 0;
+    GLint mPrismSkyPositionLocation = -1;
+    GLint mPrismSkyRotationLocation = -1;
+    GLint mPrismSkyTanHalfFovLocation = -1;
+    GLint mPrismSkySamplerLocation = -1;
+    GLint mPrismMenuPositionLocation = -1;
+    GLint mPrismMenuTextureLocation = -1;
+    GLint mPrismMenuScaleLocation = -1;
+    GLint mPrismMenuOffsetLocation = -1;
+    // World-space textured quads of the loaded scene: one GL texture per unique texture path,
+    // lazily loaded and kept for the process lifetime.
+    struct PrismEnvTexture {
+        GLuint texture = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        bool rgba = false;
+    };
+    std::unordered_map<std::string, PrismEnvTexture> mPrismEnvTextures;
+    GLuint mPrismEnvQuadProgram = 0;
+    GLint mPrismEnvQuadPositionLocation = -1;
+    GLint mPrismEnvQuadUvLocation = -1;
+    GLint mPrismEnvQuadMvpLocation = -1;
+    GLint mPrismEnvQuadTextureLocation = -1;
+    bool mPrismEnvLoadAttempted = false;
+    // Placement-only state for spatial windows, keyed by window identity. It deliberately stores
+    // no SurfaceControl, GraphicBuffer, EGLImage, texture name, or LayerSettings pointer.
+    std::unordered_map<std::string, PrismSpatialWindowState> mPrismSpatialWindowStates;
+    uint64_t mPrismSceneFrame = 0;
+    // A joined set of source-layer ids, used to report scene membership changes once.
+    std::string mPrismSpatialWindowLoggedLayers;
     // this is a 1x1 RGB buffer, but over-allocate in case a driver wants more
     // memory or if it needs to satisfy alignment requirements. In this case:
     // assume that each channel requires 4 bytes, and add 3 additional bytes to

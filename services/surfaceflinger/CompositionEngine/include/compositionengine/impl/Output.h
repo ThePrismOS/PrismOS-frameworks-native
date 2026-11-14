@@ -154,6 +154,7 @@ protected:
 
     bool mustRecompose() const;
 
+
 private:
     void dirtyEntireOutput();
     compositionengine::OutputLayer* findLayerRequestingBackgroundComposition() const;

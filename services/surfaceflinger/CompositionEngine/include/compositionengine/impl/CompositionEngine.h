@@ -18,6 +18,8 @@
 
 #include <compositionengine/CompositionEngine.h>
 
+#include <vector>
+
 namespace android::compositionengine::impl {
 
 class CompositionEngine : public compositionengine::CompositionEngine {
@@ -56,7 +58,6 @@ public:
     // Testing
     void setNeedsAnotherUpdateForTest(bool);
 
-private:
     std::unique_ptr<HWComposer> mHwComposer;
     std::unique_ptr<renderengine::RenderEngine> mRenderEngine;
     std::shared_ptr<TimeStats> mTimeStats;

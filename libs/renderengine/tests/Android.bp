@@ -31,6 +31,7 @@ cc_test {
     srcs: [
         "DisplaySettingsTest.cpp",
         "LayerSettingsTest.cpp",
+        "PrismSpatialLayoutTest.cpp",
         "RenderEngineTest.cpp",
         "RenderEngineThreadedTest.cpp",
     ],
@@ -61,5 +62,21 @@ cc_test {
         "libsync",
         "libui",
         "libutils",
+    ],
+}
+
+// Host-runnable subset: the Prism spatial layout helpers are header-only and depend on no GL,
+// so the placement logic can be exercised without a device.
+cc_test_host {
+    name: "prism_spatial_layout_test",
+    srcs: [
+        "PrismSpatialLayoutTest.cpp",
+    ],
+    header_libs: [
+        "librenderengine_prism_headers",
+    ],
+    shared_libs: [
+        "libbase",
+        "liblog",
     ],
 }

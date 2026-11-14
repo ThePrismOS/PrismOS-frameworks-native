@@ -74,5 +74,26 @@ std::future<RenderEngineResult> RenderEngine::drawLayers(
     return resultFuture;
 }
 
+std::future<RenderEngineResult> RenderEngine::drawLayersWithPrismScene(
+        const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+        const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
+        base::unique_fd&& bufferFence, const PrismSceneSettings& scene) {
+    const auto resultPromise = std::make_shared<std::promise<RenderEngineResult>>();
+    std::future<RenderEngineResult> resultFuture = resultPromise->get_future();
+    drawLayersInternalWithPrismScene(std::move(resultPromise), display, layers, buffer,
+                                     useFramebufferCache, std::move(bufferFence), scene);
+    return resultFuture;
+}
+
+void RenderEngine::drawLayersInternalWithPrismScene(
+        const std::shared_ptr<std::promise<RenderEngineResult>>&& resultPromise,
+        const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+        const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
+        base::unique_fd&& bufferFence, const PrismSceneSettings& /*scene*/) {
+    // Non-GLES backends retain the existing layer-only behavior until they implement a scene path.
+    drawLayersInternal(std::move(resultPromise), display, layers, buffer, useFramebufferCache,
+                       std::move(bufferFence));
+}
+
 } // namespace renderengine
 } // namespace android

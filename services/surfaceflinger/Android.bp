@@ -18,6 +18,10 @@ cc_defaults {
         "-Wunused",
         "-Wunreachable-code",
         "-Wconversion",
+        "-DPRISMOS_STEREO_COMPOSITOR=1",
+    ],
+    shared_libs: [
+        "libsensor",
     ],
 }
 
@@ -175,6 +179,7 @@ filegroup {
         "LayerVector.cpp",
         "MonitoredProducer.cpp",
         "NativeWindowSurface.cpp",
+        "PrismHeadTracker.cpp",
         "RefreshRateOverlay.cpp",
         "RegionSamplingThread.cpp",
         "RenderArea.cpp",

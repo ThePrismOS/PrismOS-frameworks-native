@@ -342,6 +342,29 @@ std::future<RenderEngineResult> RenderEngineThreaded::drawLayers(
     return resultFuture;
 }
 
+std::future<RenderEngineResult> RenderEngineThreaded::drawLayersWithPrismScene(
+        const DisplaySettings& display, const std::vector<LayerSettings>& layers,
+        const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
+        base::unique_fd&& bufferFence, const PrismSceneSettings& scene) {
+    ATRACE_CALL();
+    const auto resultPromise = std::make_shared<std::promise<RenderEngineResult>>();
+    std::future<RenderEngineResult> resultFuture = resultPromise->get_future();
+    int fd = bufferFence.release();
+    {
+        std::lock_guard lock(mThreadMutex);
+        mFunctionCalls.push([resultPromise, display, layers, buffer, useFramebufferCache, fd, scene](
+                                    renderengine::RenderEngine& instance) {
+            ATRACE_NAME("REThreaded::drawLayersWithPrismScene");
+            resultPromise->set_value(instance.drawLayersWithPrismScene(
+                                             display, layers, buffer, useFramebufferCache,
+                                             base::unique_fd(fd), scene)
+                                             .get());
+        });
+    }
+    mCondition.notify_one();
+    return resultFuture;
+}
+
 void RenderEngineThreaded::cleanFramebufferCache() {
     ATRACE_CALL();
     // This function is designed so it can run asynchronously, so we do not need to wait

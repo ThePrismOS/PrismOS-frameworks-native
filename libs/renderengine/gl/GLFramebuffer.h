@@ -46,6 +46,8 @@ public:
     int32_t getBufferHeight() const { return mBufferHeight; }
     int32_t getBufferWidth() const { return mBufferWidth; }
     GLenum getStatus() const { return mStatus; }
+    bool prepareDepthBuffer(uint32_t width, uint32_t height);
+    void detachDepthBuffer();
     void bind() const;
     void bindAsReadBuffer() const;
     void bindAsDrawBuffer() const;
@@ -58,6 +60,9 @@ private:
     bool usingFramebufferCache = false;
     GLenum mStatus = GL_FRAMEBUFFER_UNSUPPORTED;
     uint32_t mTextureName, mFramebufferName;
+    uint32_t mDepthBufferName = 0;
+    uint32_t mDepthBufferWidth = 0;
+    uint32_t mDepthBufferHeight = 0;
 
     int32_t mBufferHeight = 0;
     int32_t mBufferWidth = 0;

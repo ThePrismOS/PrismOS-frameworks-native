@@ -153,6 +153,9 @@ public:
         // The region of the output which should be considered dirty
         Region dirtyRegion;
         int32_t aboveBlurRequests = 0;
+        // PrismOS scene mode: the spatial scene replaces the entire flat UI — no layer is
+        // handed to the HWC and the flat draw is skipped; the client target is the whole frame.
+        bool prismSceneReplacesUi = false;
     };
 
     virtual ~Output();
@@ -181,6 +184,7 @@ public:
     virtual void setNextBrightness(float brightness) = 0;
     // Sets the bounds to use
     virtual void setDisplaySize(const ui::Size&) = 0;
+
     // Gets the transform hint used in layers that belong to this output. Used to guide
     // composition orientation so that HW overlay can be used when display isn't in its natural
     // orientation on some devices. Therefore usually we only use transform hint from display

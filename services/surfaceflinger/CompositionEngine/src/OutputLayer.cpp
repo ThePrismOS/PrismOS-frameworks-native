@@ -716,6 +716,12 @@ HWC2::Layer* OutputLayer::getHwcLayer() const {
 
 bool OutputLayer::requiresClientComposition() const {
     const auto& state = getState();
+    // An explicitly forced layer stays on the client path even when the hardware composer
+    // asks for it back during validate: the PrismOS stereo packing composites every layer
+    // into the client target and cannot tolerate a layer escaping to the device.
+    if (state.forceClientComposition) {
+        return true;
+    }
     return !state.hwc || state.hwc->hwcCompositionType == Composition::CLIENT;
 }
 

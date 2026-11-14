@@ -24,6 +24,7 @@
 #include <renderengine/RenderEngine.h>
 #include <utils/Trace.h>
 
+
 // TODO(b/129481165): remove the #pragma below and fix conversion issues
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wconversion"
