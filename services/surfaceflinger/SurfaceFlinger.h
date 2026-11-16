@@ -650,6 +650,7 @@ private:
             const sp<gui::ITransactionTraceListener>& listener) override;
 
     int getGPUContextPriority() override;
+    status_t getPrismGazeHit(bool& valid, std::string& windowName, float& u, float& v) override;
 
     status_t getMaxAcquiredBufferCount(int* buffers) const override;
 
@@ -1149,6 +1150,9 @@ private:
         std::vector<Quad> quads;
     };
     PrismSceneDescription mPrismSceneDescription;
+    // PrismOS immersive fullscreen window id (empty = multi-window scene). Kept with the
+    // description under mPrismSceneMutex and applied to PrismSceneSettings in composite().
+    std::string mPrismImmersiveWindow;
     // PrismOS: the PrismSceneSettings composite() built for the current frame. Captures
     // (screencap, scrcpy) render outside the composite pipeline and reuse it so that they
     // show the same scene the panel shows. Guarded by mPrismSceneMutex.

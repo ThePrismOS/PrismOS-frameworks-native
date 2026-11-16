@@ -181,6 +181,8 @@ public:
     // Sets the user-preferred display mode that a device should boot in
     static status_t setBootDisplayMode(const sp<IBinder>& display, ui::DisplayModeId);
     // Clears the user-preferred display mode
+    // PrismOS: gaze ray cast against the spatial windows.
+    static status_t getPrismGazeHit(bool* valid, std::string* windowName, float* u, float* v);
     static status_t clearBootDisplayMode(const sp<IBinder>& display);
 
     // Sets the frame rate of a particular app (uid). This is currently called

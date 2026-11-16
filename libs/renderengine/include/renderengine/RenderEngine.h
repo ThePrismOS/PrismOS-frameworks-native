@@ -173,6 +173,10 @@ public:
             const std::shared_ptr<ExternalTexture>& buffer, const bool useFramebufferCache,
             base::unique_fd&& bufferFence, const PrismSceneSettings& scene);
 
+    // PrismOS spatial input: the latest gaze ray cast against the spatial windows.
+    // valid=false when the ray hit no window. Backends without the scene path never hit.
+    virtual void getPrismGazeHit(bool& valid, std::string& windowName, float& u, float& v) {}
+
     // Clean-up method that should be called on the main thread after the
     // drawFence returned by drawLayers fires. This method will free up
     // resources used by the most recently drawn frame. If the frame is still

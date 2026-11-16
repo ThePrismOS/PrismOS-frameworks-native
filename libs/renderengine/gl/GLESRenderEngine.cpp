@@ -1891,6 +1891,15 @@ void GLESRenderEngine::drawPrismMenuOverlay(float eyeViewportHeight) {
     glEnable(GL_DEPTH_TEST);
 }
 
+void GLESRenderEngine::getPrismGazeHit(bool& valid, std::string& windowName, float& u,
+                                       float& v) {
+    std::lock_guard lock(mPrismGazeHit.mutex);
+    valid = mPrismGazeHit.valid;
+    windowName = mPrismGazeHit.windowName;
+    u = mPrismGazeHit.u;
+    v = mPrismGazeHit.v;
+}
+
 bool GLESRenderEngine::drawPrismScene(
         const DisplaySettings& display, const PrismSceneSettings& scene,
         const std::vector<PrismSpatialLayer>& spatialLayers,
@@ -2093,6 +2102,60 @@ bool GLESRenderEngine::drawPrismScene(
         return true;
     };
 
+    // PrismOS immersive fullscreen: draws the application buffer over the whole eye view
+    // (both eyes get the same image on the stereo panel) with the shell hidden. The flat
+    // 2D orientation is kept: no world transform, no mount mirror compensation.
+    const auto drawSpatialWindowFullscreen = [&](const PrismSpatialLayer& spatial) {
+        const LayerSettings* layer = spatial.layer;
+        if (layer == nullptr || layer->source.buffer.buffer == nullptr) {
+            return false;
+        }
+        const sp<GraphicBuffer> windowBuffer = layer->source.buffer.buffer->getBuffer();
+        const uint32_t bufferWidth = windowBuffer->getWidth();
+        const uint32_t bufferHeight = windowBuffer->getHeight();
+        if (bufferWidth == 0 || bufferHeight == 0) {
+            return false;
+        }
+        validateInputBufferUsage(windowBuffer);
+        bindExternalTextureBuffer(layer->source.buffer.textureName, windowBuffer,
+                                  layer->source.buffer.fence);
+        Texture windowTexture(Texture::TEXTURE_EXTERNAL, layer->source.buffer.textureName);
+        windowTexture.setMatrix(layer->source.buffer.textureTransform.asArray());
+        windowTexture.setFiltering(layer->source.buffer.useTextureFiltering);
+        windowTexture.setDimensions(bufferWidth, bufferHeight);
+
+        Mesh windowMesh = Mesh::Builder()
+                                  .setPrimitive(Mesh::TRIANGLE_FAN)
+                                  .setVertices(4 /* count */, 2 /* size */)
+                                  .setTexCoords(2 /* size */)
+                                  .build();
+        Mesh::VertexArray<vec2> position(windowMesh.getPositionArray<vec2>());
+        position[0] = vec2(-1.0f, 1.0f);
+        position[1] = vec2(-1.0f, -1.0f);
+        position[2] = vec2(1.0f, -1.0f);
+        position[3] = vec2(1.0f, 1.0f);
+        Mesh::VertexArray<vec2> texCoords(windowMesh.getTexCoordArray<vec2>());
+        texCoords[0] = vec2(0.0f, 0.0f);
+        texCoords[1] = vec2(0.0f, 1.0f);
+        texCoords[2] = vec2(1.0f, 1.0f);
+        texCoords[3] = vec2(1.0f, 0.0f);
+
+        mState.projectionMatrix = mat4();
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_BLEND);
+        setupLayerTexturing(windowTexture);
+        setupLayerBlending(layer->source.buffer.usePremultipliedAlpha,
+                           layer->source.buffer.isOpaque, false /* disableTexture */,
+                           half4(1.0f, 1.0f, 1.0f, layer->alpha), 0.0f);
+        drawMesh(windowMesh);
+        disableTexturing();
+        disableBlending();
+        glDepthMask(GL_TRUE);
+        glEnable(GL_DEPTH_TEST);
+        return true;
+    };
+
     const auto drawEye = [&](GLint viewportY, GLint viewportHeight, float eyeOffset) {
         glViewport(0, viewportY, targetWidth, viewportHeight);
         glScissor(0, viewportY, targetWidth, viewportHeight);
@@ -2184,6 +2247,22 @@ bool GLESRenderEngine::drawPrismScene(
         // quads, and the menu strip on top of everything (screen-space overlay).
         const mat4 view = mat4::translate(vec4(eyeOffset, 0.0f, 0.0f, 1.0f)) * headView;
         const mat4 eyeMvp = projection * view;
+
+        // PrismOS immersive fullscreen: the immersive application fills the eye; sky,
+        // grid, quads, other windows and the menu strip are skipped. Other tasks keep
+        // their surfaces untouched and return to the scene when immersive is turned off.
+        bool immersiveDrawn = false;
+        if (!scene.immersiveWindow.empty()) {
+            for (auto spatial = spatialLayers.rbegin(); spatial != spatialLayers.rend();
+                 ++spatial) {
+                if (prismLayerNameMatches(spatial->layer->name, scene.immersiveWindow)) {
+                    immersiveDrawn = drawSpatialWindowFullscreen(*spatial);
+                }
+            }
+        }
+        if (immersiveDrawn) {
+            return;
+        }
         drawPrismSkyBackdrop(headView, 1.0f / focalLength,
                              static_cast<float>(targetWidth) / static_cast<float>(viewportHeight));
         // The reference grid: always drawn (it is the "scene reaches the panel" marker and a
@@ -2232,6 +2311,61 @@ bool GLESRenderEngine::drawPrismScene(
     } else {
         drawEye(0, leftHeight, -scene.ipd * 0.5f);
         drawEye(leftHeight, rightHeight, scene.ipd * 0.5f);
+    }
+
+    // PrismOS spatial input: cast the gaze ray (head position + forward direction in the
+    // world) against every spatial window plane and keep the nearest hit. The hit carries
+    // the window name and the normalized in-window coordinates (u right, v down) — exactly
+    // what the input side needs to convert into a touch on the application view.
+    {
+        const float* h = scene.headTransform.asArray();
+        // headTransform is column major; direction = R * (0,0,-1), origin = R * (0,0,0,1).
+        const float ox = h[12], oy = h[13], oz = h[14];
+        float dx = -h[8], dy = -h[9], dz = -h[10];
+        const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (len > 1e-6f) {
+            dx /= len;
+            dy /= len;
+            dz /= len;
+        }
+        bool hitValid = false;
+        std::string hitName;
+        float hitU = 0.5f, hitV = 0.5f, hitT = 1e9f;
+        for (const auto& spatial : spatialLayers) {
+            const auto& s = spatial.settings;
+            if (dz > -1e-6f) {
+                continue; // looking away from the window plane
+            }
+            const float t = (-s.distanceMeters - oz) / dz;
+            if (t <= 0.0f || t >= hitT) {
+                continue;
+            }
+            const float px = ox + dx * t - s.centerXMeters;
+            const float py = oy + dy * t - s.centerYMeters;
+            const float height = std::max(0.05f, s.heightMeters);
+            const auto* layer = spatial.layer;
+            const float width = layer != nullptr &&
+                            layer->source.buffer.buffer != nullptr
+                    ? height * static_cast<float>(layer->source.buffer.buffer->getBuffer()->getWidth()) /
+                            static_cast<float>(layer->source.buffer.buffer->getBuffer()->getHeight())
+                    : height;
+            const float halfW = width * 0.5f, halfH = height * 0.5f;
+            if (px < -halfW || px > halfW || py < -halfH || py > halfH) {
+                continue;
+            }
+            hitValid = true;
+            hitName = s.id;
+            hitT = t;
+            hitU = px / width + 0.5f;
+            hitV = 0.5f - py / height;
+        }
+        {
+            std::lock_guard lock(mPrismGazeHit.mutex);
+            mPrismGazeHit.valid = hitValid;
+            mPrismGazeHit.windowName = hitName;
+            mPrismGazeHit.u = hitU;
+            mPrismGazeHit.v = hitV;
+        }
     }
     for (const auto& spatial : spatialLayers) {
         const sp<GraphicBuffer> buffer = spatial.layer->source.buffer.buffer->getBuffer();

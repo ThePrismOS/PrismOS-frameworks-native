@@ -2426,6 +2426,7 @@ void SurfaceFlinger::composite(nsecs_t frameTime, int64_t vsyncId)
                 appendPrismWindowOverrides(&scene);
                 refreshArgs.prismScene = scene;
                 {
+                    scene.immersiveWindow = mPrismImmersiveWindow;
                     std::lock_guard sceneLock(mPrismSceneMutex);
                     mLastPrismScene = scene;
                 }
@@ -5394,6 +5395,8 @@ void SurfaceFlinger::vrenderCommand(const DumpArgs& args, std::string& result) {
         StringAppendF(&result, "  sky:  %s\n", description.skyPath.c_str());
         StringAppendF(&result, "  menu: %s\n", description.menuPath.c_str());
         StringAppendF(&result, "  quads: %zu\n", description.quads.size());
+        StringAppendF(&result, "  immersive: %s\n",
+                      mPrismImmersiveWindow.empty() ? "off" : mPrismImmersiveWindow.c_str());
         for (const auto& quad : description.quads) {
             StringAppendF(&result,
                           "    %s tex=%s pos=(%.2f, %.2f, dist=%.2f) height=%.2f yaw=%.0f%s\n",
@@ -5422,6 +5425,17 @@ void SurfaceFlinger::vrenderCommand(const DumpArgs& args, std::string& result) {
         return;
     }
 
+    if (sub == "immersive") {
+        const std::string id = arg(2);
+        if (id == "off" || id.empty()) {
+            mPrismImmersiveWindow.clear();
+            result = "PrismOS vrender: immersive fullscreen off (multi-window scene)\n";
+        } else {
+            mPrismImmersiveWindow = id;
+            result = "PrismOS vrender: immersive fullscreen = " + id + "\n";
+        }
+        return;
+    }
     if (sub == "sky") {
         description.skyPath = arg(2);
         description.loaded = true;
@@ -6113,7 +6127,8 @@ status_t SurfaceFlinger::CheckTransactCodeCredentials(uint32_t code) {
         case SET_FRAME_RATE:
         case GET_DISPLAY_DECORATION_SUPPORT:
         case SET_FRAME_TIMELINE_INFO:
-        case GET_GPU_CONTEXT_PRIORITY:
+        case PRISM_GAZE_HIT: // PrismOS spatial input, system-internal
+                case GET_GPU_CONTEXT_PRIORITY:
         case GET_MAX_ACQUIRED_BUFFER_COUNT: {
             // This is not sensitive information, so should not require permission control.
             return OK;
@@ -7782,6 +7797,14 @@ status_t SurfaceFlinger::addTransactionTraceListener(
 int SurfaceFlinger::getGPUContextPriority() {
     return getRenderEngine().getContextPriority();
 }
+
+// PrismOS: gaze ray cast against the spatial windows (see GLESRenderEngine).
+status_t SurfaceFlinger::getPrismGazeHit(bool& valid, std::string& windowName, float& u,
+                                         float& v) {
+    getRenderEngine().getPrismGazeHit(valid, windowName, u, v);
+    return NO_ERROR;
+}
+
 
 int SurfaceFlinger::calculateMaxAcquiredBufferCount(Fps refreshRate,
                                                     std::chrono::nanoseconds presentLatency) {

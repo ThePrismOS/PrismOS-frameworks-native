@@ -105,6 +105,16 @@ bool ComposerService::connectLocked() {
     return true;
 }
 
+// PrismOS: gaze ray cast against the spatial windows.
+status_t SurfaceComposerClient::getPrismGazeHit(bool* valid, std::string* windowName, float* u,
+                                                float* v) {
+    const sp<ISurfaceComposer> sf(ComposerService::getComposerService());
+    if (sf == nullptr) {
+        return NO_INIT;
+    }
+    return sf->getPrismGazeHit(*valid, *windowName, *u, *v);
+}
+
 /*static*/ sp<ISurfaceComposer> ComposerService::getComposerService() {
     ComposerService& instance = ComposerService::getInstance();
     Mutex::Autolock _l(instance.mLock);

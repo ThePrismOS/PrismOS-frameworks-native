@@ -363,6 +363,19 @@ private:
     // no SurfaceControl, GraphicBuffer, EGLImage, texture name, or LayerSettings pointer.
     std::unordered_map<std::string, PrismSpatialWindowState> mPrismSpatialWindowStates;
     uint64_t mPrismSceneFrame = 0;
+    // PrismOS spatial input: latest gaze ray cast against the spatial windows. Written by
+    // the render thread inside drawPrismScene, read by getPrismGazeHit (dumpsys / input).
+    // Renders the latest gaze hit (PrismOS spatial input). See RenderEngine.h.
+    void getPrismGazeHit(bool& valid, std::string& windowName, float& u, float& v) override;
+
+    struct PrismGazeHit {
+        std::mutex mutex;
+        bool valid = false;
+        std::string windowName;
+        float u = 0.5f;
+        float v = 0.5f;
+    };
+    PrismGazeHit mPrismGazeHit;
     // A joined set of source-layer ids, used to report scene membership changes once.
     std::string mPrismSpatialWindowLoggedLayers;
     // this is a 1x1 RGB buffer, but over-allocate in case a driver wants more

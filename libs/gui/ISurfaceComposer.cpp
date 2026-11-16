@@ -975,6 +975,23 @@ public:
         return reply.readInt32();
     }
 
+    status_t getPrismGazeHit(bool& valid, std::string& windowName, float& u, float& v) override {
+        Parcel data, reply;
+        data.writeInterfaceToken(ISurfaceComposer::getInterfaceDescriptor());
+        status_t err = remote()->transact(BnSurfaceComposer::PRISM_GAZE_HIT, data, &reply);
+        if (err != NO_ERROR) {
+            return err;
+        }
+        valid = reply.readInt32() != 0;
+        err = reply.readUtf8FromUtf16(&windowName);
+        if (err != NO_ERROR) {
+            return err;
+        }
+        u = reply.readFloat();
+        v = reply.readFloat();
+        return NO_ERROR;
+    }
+
     status_t getMaxAcquiredBufferCount(int* buffers) const override {
         Parcel data, reply;
         data.writeInterfaceToken(ISurfaceComposer::getInterfaceDescriptor());
@@ -1674,6 +1691,21 @@ status_t BnSurfaceComposer::onTransact(
             CHECK_INTERFACE(ISurfaceComposer, data, reply);
             int priority = getGPUContextPriority();
             SAFE_PARCEL(reply->writeInt32, priority);
+            return NO_ERROR;
+        }
+        case PRISM_GAZE_HIT: {
+            CHECK_INTERFACE(ISurfaceComposer, data, reply);
+            bool valid = false;
+            std::string windowName;
+            float u = 0.5f, v = 0.5f;
+            status_t err = getPrismGazeHit(valid, windowName, u, v);
+            if (err != NO_ERROR) {
+                return err;
+            }
+            SAFE_PARCEL(reply->writeInt32, valid ? 1 : 0);
+            SAFE_PARCEL(reply->writeUtf8AsUtf16, windowName);
+            SAFE_PARCEL(reply->writeFloat, u);
+            SAFE_PARCEL(reply->writeFloat, v);
             return NO_ERROR;
         }
         case GET_MAX_ACQUIRED_BUFFER_COUNT: {

@@ -86,6 +86,10 @@ struct PrismSceneSettings {
     float horizontalFovDegrees = 0.0f;
     float nearPlane = 0.05f;
     float farPlane = 100.0f;
+    // PrismOS immersive fullscreen: when set to a spatial window id, that application
+    // fills the whole display and the shell (sky, grid, other windows, menu) is hidden.
+    // Empty restores the multi-window scene. Other tasks keep their surfaces untouched.
+    std::string immersiveWindow;
     // Capture mode (screencap, scrcpy, screen recording): render a single centered view
     // filling the whole buffer instead of the stereo pair — what the wearer sees.
     bool monoView = false;
