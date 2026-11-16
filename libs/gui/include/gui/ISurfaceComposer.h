@@ -44,6 +44,7 @@
 #include <ui/PixelFormat.h>
 #include <ui/Rotation.h>
 #include <utils/Errors.h>
+#include <string>
 #include <utils/RefBase.h>
 #include <utils/Timers.h>
 #include <utils/Vector.h>

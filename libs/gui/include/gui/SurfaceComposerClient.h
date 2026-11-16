@@ -26,6 +26,7 @@
 #include <binder/IBinder.h>
 
 #include <utils/Errors.h>
+#include <string>
 #include <utils/RefBase.h>
 #include <utils/Singleton.h>
 #include <utils/SortedVector.h>
