@@ -175,7 +175,7 @@ public:
 
     // PrismOS spatial input: the latest gaze ray cast against the spatial windows.
     // valid=false when the ray hit no window. Backends without the scene path never hit.
-    virtual void getPrismGazeHit(bool& valid, std::string& windowName, float& u, float& v) {}
+    virtual void getPrismGazeHit(bool&, std::string&, float&, float&) {}
 
     // Clean-up method that should be called on the main thread after the
     // drawFence returned by drawLayers fires. This method will free up

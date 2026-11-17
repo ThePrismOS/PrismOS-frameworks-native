@@ -59,8 +59,6 @@ inline PrismSpatialWindowSettings automaticLayout(uint32_t slot, float bufferWid
                                                   float bufferHeight,
                                                   const PrismSceneSettings& scene) {
     const float height = std::max(0.05f, scene.spatialWindowHeightMeters);
-    const float width =
-            bufferHeight > 0.0f ? height * bufferWidth / bufferHeight : height;
     const uint32_t ring = (slot + 1) / 2;
     const float direction = (slot & 1u) == 0u ? 1.0f : -1.0f;
     const uint32_t row = slot == 0 ? 0u : (slot - 1) / 4;
@@ -68,18 +66,17 @@ inline PrismSpatialWindowSettings automaticLayout(uint32_t slot, float bufferWid
     settings.distanceMeters = std::max(0.25f, scene.spatialWindowDistanceMeters);
     settings.heightMeters = height;
     settings.suppressFlatCopy = scene.spatialWindowSuppressFlatCopy;
-    float x = slot == 0 ? 0.0f
-            : direction * static_cast<float>(ring) * (width + scene.spatialWindowSpacingMeters);
-    if (scene.horizontalFovDegrees > 0.0f && slot != 0) {
-        const float hFovHalfRad =
-                scene.horizontalFovDegrees * static_cast<float>(M_PI) / 360.0f;
-        const float xMax = std::max(0.0f, settings.distanceMeters * std::tan(hFovHalfRad) -
-                width * 0.5f - 0.05f);
-        x = std::clamp(x, -xMax, xMax);
-    }
-    settings.centerXMeters = x;
+    // PrismOS ring layout around the camera: slot 0 dead ahead, the rest spread around
+    // the user in yaw steps (Horizon-style). The yaw positions are computed on the unit
+    // ring and scaled by the distance, so turning the head finds every window.
+    const float yawRad = slot == 0 ? 0.0f
+            : direction * static_cast<float>(ring) * 30.0f * static_cast<float>(M_PI) / 180.0f;
+    settings.yawDegrees = slot == 0 ? 0.0f : direction * static_cast<float>(ring) * 30.0f;
+    settings.centerXMeters = slot == 0 ? 0.0f : std::sin(yawRad) * settings.distanceMeters;
     settings.centerYMeters =
             -static_cast<float>(row) * (height + scene.spatialWindowSpacingMeters);
+    settings.distanceMeters = slot == 0 ? settings.distanceMeters
+            : settings.distanceMeters * std::cos(yawRad);
     return settings;
 }
 
