@@ -184,11 +184,17 @@ const std::array<GLfloat, kPrismGridVertexCount * kPrismGridStrideFloats> kPrism
 }();
 constexpr GLfloat kPrismSkyQuadPositions[] = {-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
 // The unit world quad: x,y in [-0.5, 0.5], z = 0; uv with v=0 at the top.
-constexpr GLfloat kPrismWorldQuadVertices[] = {
-        -0.5f, -0.5f, 0.0f, 0.0f, 1.0f,
-         0.5f, -0.5f, 0.0f, 1.0f, 1.0f,
-        -0.5f,  0.5f, 0.0f, 0.0f, 0.0f,
-         0.5f,  0.5f, 0.0f, 1.0f, 0.0f,
+constexpr GLfloat kPrismWorldQuadPositions[] = {
+        -0.5f, -0.5f, 0.0f,
+         0.5f, -0.5f, 0.0f,
+        -0.5f,  0.5f, 0.0f,
+         0.5f,  0.5f, 0.0f,
+};
+constexpr GLfloat kPrismWorldQuadUvs[] = {
+        0.0f, 1.0f,
+        1.0f, 1.0f,
+        0.0f, 0.0f,
+        1.0f, 0.0f,
 };
 
 GLuint compilePrismShader(GLenum type, const char* source) {
@@ -1278,8 +1284,15 @@ std::vector<GLESRenderEngine::PrismSpatialLayer> GLESRenderEngine::resolvePrismS
                     static_cast<float>(buffer->getHeight());
             state->second.automaticLayoutSlot = slot;
         }
+        // PrismOS: the width in meters is computed on the insert frame and PRESERVED after —
+        // the gaze tap re-cast gates on this field, so overwriting it with 0 on non-insert
+        // frames silently rejected every window ("no window under gaze"). The buffer must
+        // stay untouched outside the insert path: re-reading it per frame crashes the Adreno
+        // driver's buffer binding (SIGSEGV in memcpy inside drawEye — bisected 2026-11-22).
+        if (widthMeters > 0.0f) {
+            state->second.widthMeters = widthMeters;
+        }
         state->second.lastSeenFrame = frame;
-        state->second.widthMeters = widthMeters;
         if (state->second.lastResolvedFrame == frame) {
             // The second SBS eye copy of the same window this frame: the scene draws each
             // window once per eye, so a second entry would double-blend it.
@@ -1302,9 +1315,13 @@ std::vector<GLESRenderEngine::PrismSpatialLayer> GLESRenderEngine::resolvePrismS
         const uint32_t placeSlot = state->second.automaticLayoutSlot;
         const float placeDir = (placeSlot & 1u) == 0u ? 1.0f : -1.0f;
         const uint32_t placeRing = (placeSlot + 1) / 2;
-        const float placeYawDeg = placeSlot == 0 ? 0.0f : placeDir * placeRing * 40.0f;
+        const float placeYawDeg = placeSlot == 0 ? 0.0f : placeDir * placeRing * 30.0f;
         const float placeYawRad = placeYawDeg * static_cast<float>(M_PI) / 180.0f;
-        effective.yawDegrees = placeYawDeg;
+        // The plane normal after rotateY(yaw) is (sin yaw, 0, cos yaw): for a window placed
+        // at x = sin(yaw)·dist that normal points AWAY from the camera (~80° glancing — the
+        // window shows edge-on). The orientation yaw must mirror the position yaw so the
+        // plane faces the user; the gaze re-cast reads the same field, so one flip fixes both.
+        effective.yawDegrees = -placeYawDeg;
         effective.centerXMeters = std::sin(placeYawRad) * effective.distanceMeters;
         effective.centerYMeters = state->second.settings.centerYMeters;
         effective.distanceMeters = std::cos(placeYawRad) * effective.distanceMeters;
@@ -1619,6 +1636,29 @@ bool GLESRenderEngine::ensurePrismEnvironment(const PrismSceneSettings& scene) {
         }
     }
 
+    // PrismOS: pre-load every scene quad texture BEFORE the eye draw — glTexImage2D must
+    // never run between the env-quad attribute setup and its glDrawArrays (a first-draw
+    // upload mid-frame left the driver reading a stale vertex-attribute state; see
+    // drawPrismEnvQuads). The per-quad load in the draw loop stays as a fallback only.
+    for (const auto& quad : scene.envQuads) {
+        if (quad.texturePath.empty()) {
+            continue;
+        }
+        auto& envTexture = mPrismEnvTextures[quad.texturePath];
+        if (envTexture.texture == 0) {
+            GLuint texture = 0;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            if (loadPrismRawTexture(quad.texturePath, &texture, &width, &height)) {
+                envTexture.texture = texture;
+                envTexture.width = width;
+                envTexture.height = height;
+            } else {
+                mPrismEnvTextures.erase(quad.texturePath);
+            }
+        }
+    }
+
     // Menu strip: RGBA overlay anchored to the top of each eye viewport. The uv is derived
     // from the NDC position, so the shared position-only quad works for it too.
     static constexpr const char* kMenuVertexShader = R"(
@@ -1827,14 +1867,18 @@ void GLESRenderEngine::drawPrismEnvQuads(const PrismSceneSettings& scene, const 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glActiveTexture(GL_TEXTURE0);
-    // The unit quad comes from client-side memory (the proven draw path on this driver).
+    // PrismOS: two client arrays, BOTH at pointer offset 0 — every surviving draw on this
+    // driver (sky, grid, menu, windows) uses offset 0, and the single interleaved UV pointer
+    // at offset 12 made the Adreno driver memcpy from NULL+12 inside glDrawArrays (SIGSEGV,
+    // fault addr 0xc — bisected and symbolized 2026-11-22). Quad textures are pre-loaded in
+    // ensurePrismEnvironment so no glTexImage2D runs between the pointer setup and the draw.
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glEnableVertexAttribArray(static_cast<GLuint>(mPrismEnvQuadPositionLocation));
     glVertexAttribPointer(static_cast<GLuint>(mPrismEnvQuadPositionLocation), 3, GL_FLOAT,
-                          GL_FALSE, 20, kPrismWorldQuadVertices);
+                          GL_FALSE, 0, kPrismWorldQuadPositions);
     glEnableVertexAttribArray(static_cast<GLuint>(mPrismEnvQuadUvLocation));
     glVertexAttribPointer(static_cast<GLuint>(mPrismEnvQuadUvLocation), 2, GL_FLOAT, GL_FALSE,
-                          20, reinterpret_cast<const void*>(12));
+                          0, kPrismWorldQuadUvs);
     glUniform1i(mPrismEnvQuadTextureLocation, 0);
 
     for (const auto& quad : scene.envQuads) {
@@ -1942,6 +1986,13 @@ void GLESRenderEngine::getPrismGazeHit(bool& valid, std::string& windowName, flo
         }
         const auto& st = state.settings;
         if (st.heightMeters <= 0.0f || state.widthMeters <= 0.0f) {
+            continue;
+        }
+        // PrismOS: a state whose layer stopped appearing in the resolve is a ghost (e.g. the
+        // boot-time FallbackHome activity) — its placement can be degenerate and sit right at
+        // the camera, intercepting every ray as the nearest hit. Only states the resolve saw
+        // within the last half second participate in the tap.
+        if (mPrismSceneFrame - state.lastSeenFrame > 30) {
             continue;
         }
         // Window plane: center (cx, cy, -d), normal rotated by yaw around Y.
@@ -2236,11 +2287,14 @@ bool GLESRenderEngine::drawPrismScene(
         position[1] = vec2(-1.0f, -1.0f);
         position[2] = vec2(1.0f, -1.0f);
         position[3] = vec2(1.0f, 1.0f);
+        // PrismOS: the panel/mount orientation mirrors the flat buffer vertically on the eye
+        // (verified on device: the uncompensated draw showed MIRROR_V, and a full 180° UV
+        // rotation turned it into MIRROR_H — so the compensation is a v-flip only).
         Mesh::VertexArray<vec2> texCoords(windowMesh.getTexCoordArray<vec2>());
-        texCoords[0] = vec2(0.0f, 0.0f);
-        texCoords[1] = vec2(0.0f, 1.0f);
-        texCoords[2] = vec2(1.0f, 1.0f);
-        texCoords[3] = vec2(1.0f, 0.0f);
+        texCoords[0] = vec2(0.0f, 1.0f);
+        texCoords[1] = vec2(0.0f, 0.0f);
+        texCoords[2] = vec2(1.0f, 0.0f);
+        texCoords[3] = vec2(1.0f, 1.0f);
 
         mState.projectionMatrix = mat4();
         glDisable(GL_DEPTH_TEST);

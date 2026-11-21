@@ -70,6 +70,9 @@ public:
     void cleanFramebufferCache() override;
     int getContextPriority() override;
     bool supportsBackgroundBlur() override;
+    // PrismOS: the gaze re-cast must reach the GLES engine — without this forward the virtual
+    // dispatch lands on the no-op base body and every gaze tap reads "no window under gaze".
+    void getPrismGazeHit(bool& valid, std::string& windowName, float& u, float& v) override;
     void onActiveDisplaySizeChanged(ui::Size size) override;
     std::optional<pid_t> getRenderEngineTid() const override;
     void setEnableTracing(bool tracingEnabled) override;

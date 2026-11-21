@@ -399,6 +399,26 @@ bool RenderEngineThreaded::supportsBackgroundBlur() {
     return mRenderEngine->supportsBackgroundBlur();
 }
 
+// PrismOS: run the gaze re-cast on the worker thread, serialized with the scene draws —
+// the placement map it reads is only safe to touch from that thread.
+void RenderEngineThreaded::getPrismGazeHit(bool& valid, std::string& windowName, float& u,
+                                           float& v) {
+    waitUntilInitialized();
+    std::promise<void> resultPromise;
+    std::future<void> resultFuture = resultPromise.get_future();
+    {
+        std::lock_guard lock(mThreadMutex);
+        mFunctionCalls.push(
+                [&resultPromise, &valid, &windowName, &u, &v](renderengine::RenderEngine& instance) {
+                    ATRACE_NAME("REThreaded::getPrismGazeHit");
+                    instance.getPrismGazeHit(valid, windowName, u, v);
+                    resultPromise.set_value();
+                });
+    }
+    mCondition.notify_one();
+    resultFuture.get();
+}
+
 void RenderEngineThreaded::onActiveDisplaySizeChanged(ui::Size size) {
     // This function is designed so it can run asynchronously, so we do not need to wait
     // for the futures.
