@@ -33,6 +33,7 @@ struct PrismSpatialWindowSettings {
     float centerYMeters = 0.0f;
     float distanceMeters = 2.0f;
     float heightMeters = 0.9f;
+    float yawDegrees = 0.0f;
     bool suppressFlatCopy = true;
 };
 
@@ -61,8 +62,8 @@ struct PrismSceneSettings {
     // used.
     std::string spatialWindowLayer;
     // Default placement for newly discovered windows that have no entry in spatialWindows.
-    float spatialWindowDistanceMeters = 2.0f;
-    float spatialWindowHeightMeters = 0.9f;
+    float spatialWindowDistanceMeters = 0.6f;
+    float spatialWindowHeightMeters = 0.35f;
     bool spatialWindowSuppressFlatCopy = true;
     float spatialWindowSpacingMeters = 0.20f;
     // How long the renderer remembers the automatic slot of a window whose layers left the

@@ -1266,6 +1266,7 @@ std::vector<GLESRenderEngine::PrismSpatialLayer> GLESRenderEngine::resolvePrismS
         const std::string stateKey =
                 prism::spatialStateKey(layer.prismSpatialWindowId, layer.name);
         auto [state, inserted] = mPrismSpatialWindowStates.try_emplace(stateKey);
+        float widthMeters = 0.0f;
         if (inserted) {
             const sp<GraphicBuffer> buffer = layer.source.buffer.buffer->getBuffer();
             const uint32_t slot = nextFreePrismLayoutSlot();
@@ -1273,9 +1274,12 @@ std::vector<GLESRenderEngine::PrismSpatialLayer> GLESRenderEngine::resolvePrismS
                     prism::automaticLayout(slot, static_cast<float>(buffer->getWidth()),
                                            static_cast<float>(buffer->getHeight()), scene);
             state->second.settings.id = layer.name;
+            widthMeters = state->second.settings.heightMeters * static_cast<float>(buffer->getWidth()) /
+                    static_cast<float>(buffer->getHeight());
             state->second.automaticLayoutSlot = slot;
         }
         state->second.lastSeenFrame = frame;
+        state->second.widthMeters = widthMeters;
         if (state->second.lastResolvedFrame == frame) {
             // The second SBS eye copy of the same window this frame: the scene draws each
             // window once per eye, so a second entry would double-blend it.
@@ -1284,12 +1288,27 @@ std::vector<GLESRenderEngine::PrismSpatialLayer> GLESRenderEngine::resolvePrismS
         state->second.lastResolvedFrame = frame;
 
         // Overrides are merged every frame so property-driven moves apply to windows that are
-        // already seated; without one, the automatic layout is kept.
+        // already seated; without one, the automatic layout is kept. The merged placement is
+        // stored back into the map — the gaze tap re-casts against it when the display has
+        // not recomposed recently.
         PrismSpatialWindowSettings effective = state->second.settings;
         if (const auto* settingsOverride = findPrismSpatialWindowSettings(scene, layer.name)) {
             effective = *settingsOverride;
             effective.id = layer.name;
         }
+        // PrismOS ring placement (Horizon-style): slot 0 dead ahead, the rest spread
+        // around the user in yaw steps, each plane turned to face the camera. The radius
+        // comes from the (overridden) distance; the yaw from the slot ring.
+        const uint32_t placeSlot = state->second.automaticLayoutSlot;
+        const float placeDir = (placeSlot & 1u) == 0u ? 1.0f : -1.0f;
+        const uint32_t placeRing = (placeSlot + 1) / 2;
+        const float placeYawDeg = placeSlot == 0 ? 0.0f : placeDir * placeRing * 40.0f;
+        const float placeYawRad = placeYawDeg * static_cast<float>(M_PI) / 180.0f;
+        effective.yawDegrees = placeYawDeg;
+        effective.centerXMeters = std::sin(placeYawRad) * effective.distanceMeters;
+        effective.centerYMeters = state->second.settings.centerYMeters;
+        effective.distanceMeters = std::cos(placeYawRad) * effective.distanceMeters;
+        state->second.settings = effective;
         resolved.push_back({&layer, std::move(effective)});
     }
 
@@ -1593,6 +1612,10 @@ bool GLESRenderEngine::ensurePrismEnvironment(const PrismSceneSettings& scene) {
             mPrismSkyTexture = texture;
             mPrismSkyLoadedPath = scene.skyPath;
             ALOGI("PrismOS env: sky switched to %s", scene.skyPath.c_str());
+        } else {
+            // PrismOS: the file may appear later (OTA without assets, first vrender sky).
+            // Clear the attempted marker so the next scene frame retries the load.
+            mPrismSkyAttemptedPath.clear();
         }
     }
 
@@ -1657,6 +1680,9 @@ bool GLESRenderEngine::ensurePrismEnvironment(const PrismSceneSettings& scene) {
             mPrismMenuLoadedWidth = menuWidth;
             mPrismMenuLoadedHeight = menuHeight;
             ALOGI("PrismOS env: menu switched to %s", scene.menuPath.c_str());
+        } else {
+            // PrismOS: retry while the file is missing (same rule as the sky).
+            mPrismMenuAttemptedPath.clear();
         }
     }
 
@@ -1893,11 +1919,85 @@ void GLESRenderEngine::drawPrismMenuOverlay(float eyeViewportHeight) {
 
 void GLESRenderEngine::getPrismGazeHit(bool& valid, std::string& windowName, float& u,
                                        float& v) {
+    // PrismOS: re-cast LIVE instead of returning the last frame's result. The display
+    // composes only when something invalidates, so a static scene would serve a stale
+    // (often invalid) hit from the frame the head last moved. The placement map and the
+    // last head transform are all that is needed: no GL state, no buffers.
+    const float* h = mPrismLastHeadTransform.asArray();
+    const float ox = h[12], oy = h[13], oz = h[14];
+    float dx = -h[8], dy = -h[9], dz = -h[10];
+    const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (len > 1e-6f) {
+        dx /= len;
+        dy /= len;
+        dz /= len;
+    }
+
+    bool found = false;
+    std::string hitName;
+    float hitU = 0.5f, hitV = 0.5f, hitT = 1e9f;
+    for (const auto& [key, state] : mPrismSpatialWindowStates) {
+        if (state.lastResolvedFrame == 0) {
+            continue;
+        }
+        const auto& st = state.settings;
+        if (st.heightMeters <= 0.0f || state.widthMeters <= 0.0f) {
+            continue;
+        }
+        // Window plane: center (cx, cy, -d), normal rotated by yaw around Y.
+        const float yawRad = st.yawDegrees * static_cast<float>(M_PI) / 180.0f;
+        const float nx = std::sin(yawRad), nz = std::cos(yawRad);
+        const float cx = st.centerXMeters, cy = st.centerYMeters;
+        const float cz = -st.distanceMeters;
+        const float denom = dx * nx + dz * nz;
+        if (std::abs(denom) < 1e-6f) {
+            continue;
+        }
+        const float t = ((cx - ox) * nx + (cz - oz) * nz) / denom;
+        if (t <= 0.0f || t >= hitT) {
+            continue;
+        }
+        const float px = ox + dx * t - cx;
+        const float py = oy + dy * t - cy;
+        const float halfW = state.widthMeters * 0.5f, halfH = st.heightMeters * 0.5f;
+        if (std::abs(px) > halfW || std::abs(py) > halfH) {
+            continue;
+        }
+        found = true;
+        hitName = st.id;
+        hitT = t;
+        hitU = px / state.widthMeters + 0.5f;
+        hitV = 0.5f - py / st.heightMeters;
+    }
+
+    // PrismOS debug: once per second, dump the re-cast inputs to trace gaze misses.
+    {
+        static std::chrono::steady_clock::time_point sLastGazeLog;
+        const auto nowLog = std::chrono::steady_clock::now();
+        if (nowLog - sLastGazeLog > std::chrono::seconds(1)) {
+            sLastGazeLog = nowLog;
+            std::string diag = "recast: states=" + std::to_string(mPrismSpatialWindowStates.size())
+                    + " dir=(" + std::to_string(dx) + "," + std::to_string(dy) + ","
+                    + std::to_string(dz) + ")";
+            for (const auto& [key, state] : mPrismSpatialWindowStates) {
+                diag += " | '" + state.settings.id + "' yaw=" +
+                        std::to_string(state.settings.yawDegrees) + " x=" +
+                        std::to_string(state.settings.centerXMeters) + " d=" +
+                        std::to_string(state.settings.distanceMeters) + " w=" +
+                        std::to_string(state.widthMeters);
+            }
+            ALOGD("PrismOS gaze: %s", diag.c_str());
+        }
+    }
     std::lock_guard lock(mPrismGazeHit.mutex);
-    valid = mPrismGazeHit.valid;
-    windowName = mPrismGazeHit.windowName;
-    u = mPrismGazeHit.u;
-    v = mPrismGazeHit.v;
+    mPrismGazeHit.valid = found;
+    mPrismGazeHit.windowName = hitName;
+    mPrismGazeHit.u = hitU;
+    mPrismGazeHit.v = hitV;
+    valid = found;
+    windowName = hitName;
+    u = hitU;
+    v = hitV;
 }
 
 bool GLESRenderEngine::drawPrismScene(
@@ -2042,6 +2142,8 @@ bool GLESRenderEngine::drawPrismScene(
         const mat4 worldFromLocal =
                 mat4::translate(vec4(spatial.settings.centerXMeters, spatial.settings.centerYMeters,
                                      -distance, 1.0f)) *
+                mat4::rotate(spatial.settings.yawDegrees * static_cast<float>(M_PI) / 180.0f,
+                             vec3(0.0f, 1.0f, 0.0f)) *
                 mat4::scale(vec4(scale, -scale, scale, 1.0f)) *
                 mat4::translate(vec4(-static_cast<float>(bufferWidth) * 0.5f,
                                      -static_cast<float>(bufferHeight) * 0.5f, 0.0f, 1.0f));
@@ -2304,6 +2406,7 @@ bool GLESRenderEngine::drawPrismScene(
         drawPrismMenuOverlay(static_cast<float>(viewportHeight));
     };
 
+    mPrismLastHeadTransform = scene.headTransform;
     if (monoView) {
         // Capture path: a single centered view over the whole buffer — what the wearer
         // sees, usable directly for screenshots and screen recording.

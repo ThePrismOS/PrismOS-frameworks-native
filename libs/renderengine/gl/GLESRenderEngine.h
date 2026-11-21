@@ -163,6 +163,7 @@ private:
 
     struct PrismSpatialWindowState {
         PrismSpatialWindowSettings settings;
+        float widthMeters = 0.0f;
         uint64_t lastSeenFrame = 0;
         // Frame the window was last resolved into the draw list. The stereo packing emits two
         // eye copies per frame; deduping on the map insert alone would resolve a window only
@@ -376,6 +377,9 @@ private:
         float v = 0.5f;
     };
     PrismGazeHit mPrismGazeHit;
+    // Head->world transform of the most recent scene frame; the gaze tap re-casts against
+    // it so the hit is fresh even when the display has not recomposed since.
+    mat4 mPrismLastHeadTransform;
     // A joined set of source-layer ids, used to report scene membership changes once.
     std::string mPrismSpatialWindowLoggedLayers;
     // this is a 1x1 RGB buffer, but over-allocate in case a driver wants more

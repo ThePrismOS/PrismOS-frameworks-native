@@ -1,0 +1,51 @@
+/*
+ * Copyright (C) 2025 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <math/mat4.h>
+
+#include <string>
+
+namespace android::renderengine {
+
+// Immutable, frame-local parameters for the optional GLES Prism bring-up scene.
+// The render target and eye viewports are derived from DisplaySettings.
+struct PrismSceneSettings {
+    bool enabled = false;
+    bool spatialWindowEnabled = false;
+    // Debug-only selection of the Android layer that is lifted into the world-space window.
+    // An empty value picks the buffered layer with the largest buffer, so bring-up never depends
+    // on a hardcoded name. Matching accepts either the full layer name or the stable name without
+    // the "#<sequence>" suffix.
+    std::string spatialWindowLayer;
+    // World placement of the window in metres, measured along the initial gaze direction (-Z).
+    float spatialWindowDistanceMeters = 2.0f;
+    float spatialWindowHeightMeters = 0.9f;
+    // Hide the flat screen copy of the selected layer once its buffer was really drawn as a
+    // world-locked quad, so the same content is not shown twice.
+    bool spatialWindowSuppressFlatCopy = true;
+    float ipd = 0.064f;
+    float fovDegrees = 90.0f;
+    float nearPlane = 0.05f;
+    float farPlane = 100.0f;
+    // Rigid transform from head space to world space. GLES uses its inverse as the view matrix;
+    // the per-eye IPD transform remains separate. Debug rotations use column vectors and
+    // H = R_yaw * R_pitch * R_roll about +Y, +X, and +Z respectively.
+    mat4 headTransform = mat4();
+};
+
+} // namespace android::renderengine
